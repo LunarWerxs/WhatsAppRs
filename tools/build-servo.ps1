@@ -57,4 +57,9 @@ foreach ($dll in 'libEGL.dll', 'libGLESv2.dll') {
         else { throw }
     }
 }
-"built in $([int]$sw.Elapsed.TotalMinutes) min: $(Join-Path $out 'whatsapp.exe') ($([math]::Round((Get-Item (Join-Path $out 'whatsapp.exe')).Length/1MB)) MB)"
+if ($Check) {
+    "checked in $([int]$sw.Elapsed.TotalMinutes) min: no binary produced (-Check)"
+} else {
+    $built = Join-Path $out 'whatsapp.exe'
+    "built in $([int]$sw.Elapsed.TotalMinutes) min: $built ($([math]::Round((Get-Item $built).Length/1MB)) MB)"
+}

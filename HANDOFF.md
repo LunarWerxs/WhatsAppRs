@@ -216,10 +216,12 @@ Verified 2026-09-07 (session two), all by running it, instruments in `tools/`:
    **What is NOT verified: that the chat list now loads.** That needs Michael to scan the QR again.
    The app is running on his real profile with `WHATSAPP_RS_PROBE=1`, and its log
    (`scratchpad/session.err`) will capture the next login attempt.
-   **The next blocker is already known:** `IDBCursor` in Servo has no `continue`/`advance`, so a
-   cursor cannot iterate, and bulk history reads use cursors. Expect that to bite next; it is
-   another fork patch, similar in size to the Cache Storage one.
-   Also still missing and not cheaply fixable: **OPFS** (`navigator.storage.getDirectory`).
+   **The next blocker was fixed too, without waiting for it to bite:** `IDBCursor` had no
+   `continue`/`advance`/`continuePrimaryKey`, so a cursor could read one record and never move.
+   Implemented (`4acad3532`, `servo-patches/0006-*`) and verified at runtime: a five-record walk,
+   `advance(2)`, `continue(key)`, and the double-continue error case all behave to spec.
+   Still missing and not cheaply fixable: **OPFS** (`navigator.storage.getDirectory`), and
+   `IDBCursor.update`/`delete`.
    ⚠ Servo writes the cookie jar **only on a clean shutdown**. Killing the process loses the login.
    Quit from the tray. (This is how a logged-in session was lost while debugging today.)
 4. Optional: submit the five Servo commits upstream. They are exported as patch files in

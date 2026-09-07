@@ -338,10 +338,21 @@ Still missing after all of this: **OPFS**. `StorageManager` in Servo has only `p
 and `estimate`; there is no `getDirectory` and no file-system-handle machinery behind it. It cannot
 be polyfilled cheaply.
 
-**The next blocker is already visible.** `IDBCursor.webidl` declares only readonly attributes: there
-is no `continue`, `advance`, `continuePrimaryKey`, `update` or `delete`. A page can open a cursor,
-read its first record, and never move past it. Bulk history reads use cursors, so this is the most
-likely next stop after the chat list appears.
+**The next blocker was already visible, and is now fixed too.** `IDBCursor` declared only readonly
+attributes: no `continue`, `advance`, `continuePrimaryKey`, `update` or `delete`. A page could open
+a cursor, read its first record, and never move past it, which is fatal for syncing history. The
+iteration algorithm itself was already present and correct; what was missing was the plumbing from
+the DOM methods into it. Implemented in commit `4acad3532` and verified at runtime against a real
+store:
+
+| test | result |
+| --- | --- |
+| walk five records with `continue()` | visits all five in order, then ends |
+| `advance(2)` | visits 1, 3, 5 |
+| `continue(4)` then `continue()` | jumps to 4, then 5 |
+| `continue()` twice without waiting | throws `InvalidStateError`, as the spec requires |
+
+`update()` and `delete()` on a cursor are still unimplemented.
 
 ## Storage persistence on Servo, measured 2026-09-07
 
