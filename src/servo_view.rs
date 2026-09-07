@@ -123,13 +123,63 @@ const ERROR_CAPTURE_JS: &str = r#"
       if (window.__wa_errors.length > 40) { window.__wa_errors.shift(); }
     } catch (e) {}
   };
+  // The name and message first: a stack alone says where, never what.
+  var describe = function (r) {
+    if (!r) { return String(r); }
+    if (typeof r !== 'object') { return String(r); }
+    var name = r.name || r.constructor && r.constructor.name || 'Error';
+    var text = name + ': ' + (r.message || JSON.stringify(r).slice(0, 200));
+    var frame = (r.stack || '').split('\n').find(function (line) { return line.trim(); });
+    return frame ? text + ' @ ' + frame.trim() : text;
+  };
   window.addEventListener('error', function (e) {
-    push('uncaught: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+    push('uncaught: ' + (e.message || describe(e.error)) + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
   }, true);
   window.addEventListener('unhandledrejection', function (e) {
-    var r = e.reason;
-    push('rejected: ' + ((r && (r.stack || r.message)) || r));
+    push('rejected: ' + describe(e.reason));
   }, true);
+
+  // WhatsApp runs its data layer in a worker. If that worker dies the page waits
+  // on it forever and says nothing, so watch every worker this page creates.
+  var NativeWorker = window.Worker;
+  if (typeof NativeWorker === 'function') {
+    var workers = 0;
+    window.Worker = function (url, options) {
+      var id = ++workers;
+      push('worker ' + id + ' created: ' + String(url).slice(0, 120));
+      var worker = new NativeWorker(url, options);
+      worker.addEventListener('error', function (e) {
+        push('worker ' + id + ' ERROR: ' + (e.message || 'no message') +
+             ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+      });
+      var replies = 0;
+      worker.addEventListener('message', function () {
+        replies++;
+        if (replies <= 2) { push('worker ' + id + ' replied (' + replies + ')'); }
+      });
+      return worker;
+    };
+    window.Worker.prototype = NativeWorker.prototype;
+  }
+
+  // And watch the locks, since a lock that is taken and never released would
+  // stall the boot just as effectively as one that throws.
+  if (navigator.locks && navigator.locks.request) {
+    var nativeRequest = navigator.locks.request.bind(navigator.locks);
+    var calls = 0;
+    navigator.locks.request = function (name, options, callback) {
+      var id = ++calls;
+      if (id <= 6) { push('lock ' + id + ' request: ' + name); }
+      var result = nativeRequest(name, options, callback);
+      if (id <= 6 && result && result.then) {
+        result.then(
+          function () { push('lock ' + id + ' released: ' + name); },
+          function (e) { push('lock ' + id + ' FAILED: ' + name + ' ' + describe(e)); }
+        );
+      }
+      return result;
+    };
+  }
 })();
 "#;
 
@@ -562,7 +612,13 @@ impl ApplicationHandler<AppEvent> for App {
             if self.window.as_ref().map(|w| w.is_visible().unwrap_or(true)).unwrap_or(false) {
                 self.record_geometry();
             }
-            if single_instance::poll_show_request(&self.listener) {
+            let requests = single_instance::poll_requests(&self.listener);
+            if requests.quit {
+                eprintln!("[whatsapp-rs] clean shutdown requested over the instance port");
+                self.shut_down(event_loop);
+                return;
+            }
+            if requests.show {
                 self.show();
             }
             if probing() {

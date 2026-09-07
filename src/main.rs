@@ -39,6 +39,16 @@ mod tray;
 mod webview;
 
 fn main() {
+    // `--quit` asks a running instance to shut down cleanly and exits. Killing the
+    // process instead skips the cookie flush, and on Servo that costs the login.
+    if std::env::args().any(|a| a == "--quit") {
+        let port = std::env::var("WHATSAPP_RS_INSTANCE_PORT")
+            .ok()
+            .and_then(|p| p.parse::<u16>().ok());
+        single_instance::request_quit(port);
+        return;
+    }
+
     let data_dir = paths::data_dir();
 
     // No stored choice and no flag means ask. Cancelling means do not start:

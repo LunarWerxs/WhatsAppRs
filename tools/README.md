@@ -15,6 +15,7 @@ Python 3 with `websocket-client` on PATH. Run from anywhere; paths are script-re
 | `cdp-eval.py PORT file.js` | Evaluates any awaited expression in the page. `survey.js` is the one that counted WhatsApp Web's notification API calls. |
 | `build-servo.ps1 [-Check]` | Builds the app with safe mode on Servo (`--features servo`, `--profile servo`) in the environment Servo's `mach` would set up, and copies the ANGLE DLLs beside `target/servo/whatsapp.exe`. Slow: it compiles the engine. |
 | `safe-drive.ps1 [-Exe path] [-Wait 25]` | Launches safe mode on a scratch profile and its own instance lock (so a real logged-in instance is untouched), screenshots the window, prints the process tree's memory, kills it. Works for either engine build. |
+| `test-quit.ps1` | Proves `whatsapp.exe --quit` stops a running instance cleanly and that the cookie jar reaches disk. The cookie jar is only written on a clean shutdown, so this is the difference between keeping a WhatsApp login across a restart and having to scan the QR again. |
 | `light-drive.ps1 -Mode demo\|pair [-Theme light\|dark]` | Light mode's window. `demo` opens it with sample chats and no network, moves it clear of overlays, clicks the first chat with a real mouse click (after printing what is under the cursor), types into the send box, presses Enter, screenshots before and after, and prints memory. `pair` opens the real thing as far as the QR (never scanned), screenshots it, and kills it. `-Theme` forces a palette through `WHATSAPP_RS_THEME`. |
 
 ## Environment switches the Servo build understands
@@ -30,6 +31,7 @@ without a rebuild, which matters when a rebuild compiles a browser engine.
 | `WHATSAPP_RS_QUIT_AFTER=<seconds>` | Shut down cleanly, the same path as the tray's Quit. Use this for persistence tests: killing the process skips the cookie flush and loses the login. |
 | `WHATSAPP_RS_DATA_DIR=<path>` | Use a scratch profile, so a test instance never touches a real logged-in one. |
 | `WHATSAPP_RS_INSTANCE_PORT=<port>` | Take a different single-instance lock, so a test instance can run beside a real one. |
+| `--quit` (a command-line flag, not a variable) | Asks a running instance to shut down cleanly over its single-instance port. **Always stop the app this way.** Killing it skips the cookie flush and costs the WhatsApp login. |
 | `RUST_LOG=warn,whatsapp_rs=info` | Engine log detail. The app's own lines are tagged `[whatsapp-rs]`, `[console …]`, `[probe …]` and `[eval]`. |
 
 Things learned building these, so nobody rebuilds the wrong instrument:
