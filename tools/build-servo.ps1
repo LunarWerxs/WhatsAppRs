@@ -20,6 +20,21 @@ $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = 'lld-link.exe'
 if (-not $env:SERVO_STYLE_THREAD_STACK_SIZE_KB) { $env:SERVO_STYLE_THREAD_STACK_SIZE_KB = '8192' }
 
 Set-Location $Repo
+# A running instance IS the output file, and Windows will not let cargo replace it.
+# Renaming a running exe is allowed, so move it aside and let the build write fresh.
+# Stale copies from earlier builds are swept once nothing holds them.
+# Both copies: cargo links into deps\ and then places the final one alongside.
+foreach ($exe in @((Join-Path $Repo 'target\servo\whatsapp.exe'), (Join-Path $Repo 'target\servo\deps\whatsapp.exe'))) {
+    if (-not (Test-Path $exe)) { continue }
+    try { [IO.File]::OpenWrite($exe).Close() } catch {
+        $aside = [IO.Path]::ChangeExtension($exe, $null) + "inuse-" + (Get-Random) + ".exe"
+        Rename-Item $exe $aside
+        "moved a running binary aside: $(Split-Path $aside -Leaf)"
+    }
+}
+Get-ChildItem (Join-Path $Repo 'target\servo') -Recurse -Filter 'whatsapp*inuse-*.exe' -ErrorAction SilentlyContinue | ForEach-Object {
+    try { Remove-Item $_.FullName -Force -ErrorAction Stop } catch {}
+}
 $sw = [Diagnostics.Stopwatch]::StartNew()
 if ($Check) {
     cargo check --profile servo --features servo --bin whatsapp
@@ -32,6 +47,14 @@ $out = Join-Path $Repo 'target\servo'
 foreach ($dll in 'libEGL.dll', 'libGLESv2.dll') {
     $src = Get-ChildItem -Path (Join-Path $Repo 'target\servo\build') -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $src) { $src = Get-Item (Join-Path $ServoRepo "target\release\$dll") -ErrorAction SilentlyContinue }
-    if ($src) { Copy-Item $src.FullName (Join-Path $out $dll) -Force; "copied $dll from $($src.FullName)" } else { "WARNING: $dll not found" }
+    $dest = Join-Path $out $dll
+    if (-not $src) { "WARNING: $dll not found"; continue }
+    # A running instance holds these open. They never change between builds, so an
+    # existing copy is as good as a fresh one; only a MISSING one is a failure.
+    try { Copy-Item $src.FullName $dest -Force; "copied $dll from $($src.FullName)" }
+    catch {
+        if (Test-Path $dest) { "kept existing $dll (locked by a running instance)" }
+        else { throw }
+    }
 }
 "built in $([int]$sw.Elapsed.TotalMinutes) min: $(Join-Path $out 'whatsapp.exe') ($([math]::Round((Get-Item (Join-Path $out 'whatsapp.exe')).Length/1MB)) MB)"

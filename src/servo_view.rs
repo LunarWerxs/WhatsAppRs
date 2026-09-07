@@ -22,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use euclid::Scale;
 use servo::{
-    Code, DevicePoint, EventLoopWaker, InputEvent, Key, KeyState, KeyboardEvent, LoadStatus,
-    Location, Modifiers, MouseButton as ServoMouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, MouseMoveEvent, NamedKey, Notification, Opts, PermissionFeature,
-    PermissionRequest, Preferences, RenderingContext, Servo, ServoBuilder, WebView,
+    Code, ConsoleLogLevel, DevicePoint, EventLoopWaker, InputEvent, JSValue, Key, KeyState,
+    KeyboardEvent, LoadStatus, Location, Modifiers, MouseButton as ServoMouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseLeftViewportEvent, MouseMoveEvent, NamedKey,
+    Notification, Opts, PermissionFeature, PermissionRequest, PrefValue, Preferences,
+    RenderingContext, Servo, ServoBuilder, UserContentManager, UserScript, WebView,
     WebViewBuilder, WebViewDelegate, WheelDelta, WheelEvent, WheelMode, WindowRenderingContext,
 };
 use winit::application::ApplicationHandler;
@@ -52,6 +53,125 @@ enum AppEvent {
     TrayClick,
     MenuOpen,
     MenuQuit,
+}
+
+/// Injected before the page's own scripts, for two jobs.
+///
+/// First, capture errors: WhatsApp swallows most of its own, so the few that
+/// escape are the only signal we get about a stalled boot.
+///
+/// Second, fill in two APIs Servo does not have, both of which a page may call
+/// without checking. `requestIdleCallback` is a scheduling convenience and a
+/// timeout is a faithful stand-in. `navigator.locks` coordinates tabs that share
+/// one origin's storage; this app is a single page in a single process, so there
+/// is never another holder and granting immediately is not a shortcut, it is the
+/// correct answer for this case. Both are defined only when genuinely absent, so
+/// the day Servo ships them the real ones win.
+const ERROR_CAPTURE_JS: &str = r#"
+(function () {
+  if (window.__wa_errors) { return; }
+  window.__wa_errors = [];
+
+  if (typeof window.requestIdleCallback !== 'function') {
+    window.requestIdleCallback = function (callback, options) {
+      var start = Date.now();
+      var timeout = (options && options.timeout) || 1;
+      return setTimeout(function () {
+        callback({
+          didTimeout: false,
+          timeRemaining: function () { return Math.max(0, 50 - (Date.now() - start)); },
+        });
+      }, timeout > 50 ? 1 : timeout);
+    };
+    window.cancelIdleCallback = function (handle) { clearTimeout(handle); };
+  }
+
+  if (navigator.locks === undefined) {
+    var held = {};
+    var lockManager = {
+      request: function (name, options, callback) {
+        if (typeof options === 'function') { callback = options; options = {}; }
+        options = options || {};
+        var lock = { name: name, mode: options.mode || 'exclusive' };
+        if (options.ifAvailable && held[name]) { return Promise.resolve(callback(null)); }
+        var previous = held[name] || Promise.resolve();
+        var release;
+        held[name] = new Promise(function (resolve) { release = resolve; });
+        return previous
+          .then(function () { return callback(lock); })
+          .then(
+            function (value) { release(); return value; },
+            function (error) { release(); throw error; }
+          );
+      },
+      query: function () {
+        return Promise.resolve({ held: [], pending: [] });
+      },
+    };
+    try {
+      Object.defineProperty(navigator, 'locks', { value: lockManager, configurable: true });
+    } catch (e) {
+      navigator.locks = lockManager;
+    }
+  }
+
+  var push = function (s) {
+    try {
+      var text = String(s);
+      if (text.length > 400) { text = text.slice(0, 400); }
+      window.__wa_errors.push(text);
+      if (window.__wa_errors.length > 40) { window.__wa_errors.shift(); }
+    } catch (e) {}
+  };
+  window.addEventListener('error', function (e) {
+    push('uncaught: ' + (e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || 0));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    var r = e.reason;
+    push('rejected: ' + ((r && (r.stack || r.message)) || r));
+  }, true);
+})();
+"#;
+
+/// Asks the page what it has and what it is showing. Printed on load and on every
+/// tick under WHATSAPP_RS_PROBE, which is how a stall gets diagnosed from outside.
+const PROBE_JS: &str = r#"
+(function () {
+  var out = {};
+  var missing = [];
+  var globals = ['IntersectionObserver', 'ResizeObserver', 'MutationObserver', 'OffscreenCanvas',
+    'FontFace', 'BroadcastChannel', 'SharedWorker', 'Worker', 'WebAssembly', 'structuredClone',
+    'CompositionEvent', 'requestIdleCallback', 'Notification', 'indexedDB', 'caches', 'Animation'];
+  for (var i = 0; i < globals.length; i++) {
+    if (typeof window[globals[i]] === 'undefined') { missing.push(globals[i]); }
+  }
+  if (!navigator.storage) { missing.push('navigator.storage'); }
+  else if (!navigator.storage.getDirectory) { missing.push('navigator.storage.getDirectory'); }
+  if (!navigator.permissions) { missing.push('navigator.permissions'); }
+  if (!navigator.locks) { missing.push('navigator.locks'); }
+  if (!navigator.serviceWorker) { missing.push('navigator.serviceWorker'); }
+  if (!window.crypto || !window.crypto.subtle) { missing.push('crypto.subtle'); }
+  if (!document.body || typeof document.body.animate !== 'function') { missing.push('Element.animate'); }
+  out.missing = missing.join(' ');
+  out.title = document.title;
+  var body = document.body ? (document.body.innerText || '') : '';
+  out.screen = body.replace(/\s+/g, ' ').slice(0, 240);
+  out.nodes = document.getElementsByTagName('*').length;
+  out.errors = (window.__wa_errors || []).slice(-6).join(' || ');
+  out.sw = navigator.serviceWorker
+    ? (navigator.serviceWorker.controller ? 'controlled' : 'uncontrolled')
+    : 'absent';
+  return JSON.stringify(out);
+})();
+"#;
+
+/// Run the probe and print the answer to stderr, tagged with when it ran.
+fn probe(webview: &WebView, tag: &'static str) {
+    webview.evaluate_javascript(PROBE_JS, move |result| match result {
+        Ok(JSValue::String(json)) => eprintln!("[probe {tag}] {json}"),
+        Ok(other) => eprintln!("[probe {tag}] unexpected value: {other:?}"),
+        Err(err) => eprintln!("[probe {tag}] evaluation failed: {err:?}"),
+    });
 }
 
 /// One browser identity on every platform. Firefox is on WhatsApp's supported
@@ -99,6 +219,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
         modifiers: ModifiersState::empty(),
         crashed: Rc::new(RefCell::new(None)),
         _tray: None,
+        quit_at: std::env::var("WHATSAPP_RS_QUIT_AFTER")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|secs| Instant::now() + Duration::from_secs(secs)),
     };
     event_loop.run_app(&mut app)?;
     if let Some(reason) = app.crashed.borrow().clone() {
@@ -141,7 +265,26 @@ impl WebViewDelegate for Delegate {
         eprintln!("[whatsapp-rs] load status: {status:?} url={:?}", webview.url());
         if matches!(status, LoadStatus::Complete) {
             webview.focus();
+            if probing() {
+                probe(&webview, "load");
+            }
+            run_eval_hook(&webview);
         }
+    }
+
+    /// The page's own console. Without this every error WhatsApp logs is dropped,
+    /// which is why a stalled boot looked silent.
+    fn show_console_message(&self, _webview: WebView, level: ConsoleLogLevel, message: String) {
+        let level = match level {
+            ConsoleLogLevel::Error => "error",
+            ConsoleLogLevel::Warn => "warn",
+            ConsoleLogLevel::Info => "info",
+            ConsoleLogLevel::Debug => "debug",
+            ConsoleLogLevel::Trace => "trace",
+            ConsoleLogLevel::Dir => "dir",
+            ConsoleLogLevel::Log => "log",
+        };
+        eprintln!("[console {level}] {message}");
     }
 
     fn notify_cursor_changed(&self, _webview: WebView, cursor: servo::Cursor) {
@@ -153,8 +296,17 @@ impl WebViewDelegate for Delegate {
     }
 
     fn request_permission(&self, _webview: WebView, request: PermissionRequest) {
-        // Notifications are the point of the app. Nothing else is asked for by WhatsApp.
-        if matches!(request.feature(), PermissionFeature::Notifications) {
+        // Notifications are the point of the app; persistent storage keeps the
+        // message database from being evicted. Everything else is refused, and
+        // logged, because a permission this app never expected to be asked for is
+        // exactly the kind of thing that stalls a page waiting on the answer.
+        let feature = request.feature();
+        let allow = matches!(
+            feature,
+            PermissionFeature::Notifications | PermissionFeature::PersistentStorage
+        );
+        eprintln!("[whatsapp-rs] permission {feature:?}: {}", if allow { "allowed" } else { "denied" });
+        if allow {
             request.allow();
         } else {
             request.deny();
@@ -185,6 +337,10 @@ struct App {
     modifiers: ModifiersState,
     crashed: Rc<RefCell<Option<String>>>,
     _tray: Option<tray::Tray>,
+    /// `WHATSAPP_RS_QUIT_AFTER=<seconds>`: shut down cleanly, exactly as the tray's
+    /// Quit does, after this long. The clean path is the one that flushes cookies to
+    /// disk, so a persistence test has to use it rather than killing the process.
+    quit_at: Option<Instant>,
 }
 
 impl App {
@@ -226,10 +382,30 @@ impl App {
         // Everything WhatsApp needs that Servo keeps off by default, plus where it
         // keeps cookies, local storage, IndexedDB and the cache: our data dir, so a
         // login survives a restart.
+        //
+        // Servo ships most web APIs behind prefs that default to off, so an app of
+        // this size needs them turned on by name. Measured 2026-09-07: with only the
+        // first three set, login succeeded and the page then stalled on "Loading your
+        // chats" with IntersectionObserver, navigator.storage and navigator.permissions
+        // all undefined. A virtualised chat list cannot render without the first.
         let mut preferences = Preferences::default();
         preferences.dom_indexeddb_enabled = true;
         preferences.dom_serviceworker_enabled = true;
         preferences.dom_notification_enabled = true;
+        preferences.dom_intersection_observer_enabled = true;
+        preferences.dom_storage_manager_api_enabled = true;
+        preferences.dom_permissions_enabled = true;
+        preferences.dom_offscreen_canvas_enabled = true;
+        preferences.dom_web_animations_enabled = true;
+        preferences.dom_fontface_enabled = true;
+        preferences.dom_visual_viewport_enabled = true;
+        preferences.dom_composition_event_enabled = true;
+        preferences.dom_entries_api_enabled = true;
+        // Web Locks, implemented in our fork. WhatsApp's background worker calls
+        // navigator.locks.request() unguarded on its very first line, so without
+        // this the worker throws before registering its message handler, never
+        // answers the page, and the UI waits on it forever: "Loading your chats".
+        preferences.dom_weblocks_enabled = true;
         preferences.user_agent = user_agent();
         let opts = Opts {
             config_dir: Some(self.data_dir.join("servo")),
@@ -243,6 +419,11 @@ impl App {
         // Engine log lines go to stderr under RUST_LOG. A GUI build has no console,
         // so this only shows up when a launcher captures stderr (tools/safe-drive.ps1).
         servo.setup_logging();
+        apply_pref_overrides(&servo);
+
+        // The error capture has to be in place before the page's own scripts run.
+        let user_content = Rc::new(UserContentManager::new(&servo));
+        user_content.add_script(Rc::new(UserScript::new(ERROR_CAPTURE_JS.to_string(), None)));
 
         let delegate = Rc::new(Delegate {
             window: window.clone(),
@@ -252,6 +433,7 @@ impl App {
         let webview = WebViewBuilder::new(&servo, rendering_context.clone() as Rc<dyn RenderingContext>)
             .url(url)
             .hidpi_scale_factor(Scale::new(window.scale_factor() as f32))
+            .user_content_manager(user_content)
             .delegate(delegate)
             .build();
         webview.show();
@@ -303,6 +485,16 @@ impl App {
             h: size.height as u32,
             maximized: false,
         });
+    }
+
+    /// The clean shutdown. Dropping the engine runs its own, which is when the
+    /// network thread writes the cookie jar to disk; killing the process skips it.
+    fn shut_down(&mut self, event_loop: &ActiveEventLoop) {
+        self.record_geometry();
+        self.webview = None;
+        self.servo = None;
+        self.rendering_context = None;
+        event_loop.exit();
     }
 
     fn point_from(&self, position: PhysicalPosition<f64>) -> DevicePoint {
@@ -362,11 +554,21 @@ impl ApplicationHandler<AppEvent> for App {
     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
         if let StartCause::ResumeTimeReached { .. } = cause {
             self.next_tick = Instant::now() + TICK;
+            if self.quit_at.is_some_and(|at| Instant::now() >= at) {
+                eprintln!("[whatsapp-rs] clean shutdown (WHATSAPP_RS_QUIT_AFTER)");
+                self.shut_down(event_loop);
+                return;
+            }
             if self.window.as_ref().map(|w| w.is_visible().unwrap_or(true)).unwrap_or(false) {
                 self.record_geometry();
             }
             if single_instance::poll_show_request(&self.listener) {
                 self.show();
+            }
+            if probing() {
+                if let Some(webview) = &self.webview {
+                    probe(webview, "tick");
+                }
             }
             self.spin();
         }
@@ -470,13 +672,7 @@ impl ApplicationHandler<AppEvent> for App {
             }
             AppEvent::MenuOpen => self.show(),
             AppEvent::MenuQuit => {
-                self.record_geometry();
-                // Dropping the engine runs its shutdown, which is when the network
-                // thread writes the cookie jar to disk. Then the loop ends normally.
-                self.webview = None;
-                self.servo = None;
-                self.rendering_context = None;
-                event_loop.exit();
+                self.shut_down(event_loop);
                 return;
             }
         }
@@ -486,6 +682,50 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_tick));
+    }
+}
+
+/// Is the page probe switched on? `WHATSAPP_RS_PROBE=1`.
+fn probing() -> bool {
+    std::env::var_os("WHATSAPP_RS_PROBE").is_some()
+}
+
+/// `WHATSAPP_RS_EVAL="<javascript>"` runs one expression once the page has loaded
+/// and prints the result. With `WHATSAPP_RS_QUIT_AFTER=<seconds>` below, this is
+/// how storage persistence gets tested: write in one run, read in the next.
+fn run_eval_hook(webview: &WebView) {
+    let Ok(script) = std::env::var("WHATSAPP_RS_EVAL") else {
+        return;
+    };
+    webview.evaluate_javascript(script, |result| match result {
+        Ok(JSValue::String(text)) => eprintln!("[eval] {text}"),
+        Ok(other) => eprintln!("[eval] {other:?}"),
+        Err(err) => eprintln!("[eval] failed: {err:?}"),
+    });
+}
+
+/// `WHATSAPP_RS_PREFS="dom_serviceworker_enabled=false,dom_intersection_observer_enabled=true"`
+/// changes any engine preference at startup, so a suspect can be switched off and
+/// the app re-run without a rebuild. An engine build takes minutes; this takes none.
+fn apply_pref_overrides(servo: &Servo) {
+    let Ok(spec) = std::env::var("WHATSAPP_RS_PREFS") else {
+        return;
+    };
+    for entry in spec.split(',') {
+        let Some((name, raw)) = entry.split_once('=') else {
+            continue;
+        };
+        let (name, raw) = (name.trim(), raw.trim());
+        let value = match raw {
+            "true" => PrefValue::Bool(true),
+            "false" => PrefValue::Bool(false),
+            other => match other.parse::<i64>() {
+                Ok(n) => PrefValue::Int(n),
+                Err(_) => PrefValue::Str(other.to_string()),
+            },
+        };
+        eprintln!("[whatsapp-rs] pref override {name} = {raw}");
+        servo.set_preference(name, value);
     }
 }
 

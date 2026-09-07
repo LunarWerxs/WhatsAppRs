@@ -4,7 +4,11 @@ param(
     # A scratch profile and its own instance lock, so a real logged-in instance is untouched.
     [string]$DataDir = "$env:LOCALAPPDATA\WhatsAppRs-test",
     [string]$OutDir = $PSScriptRoot,
-    [string]$Tag = 'safe'
+    [string]$Tag = 'safe',
+    # Leave the app running afterwards (for a diagnosis against the real profile
+    # that should stay usable), and use the normal instance lock port.
+    [switch]$Keep,
+    [string]$InstancePort = '47998'
 )
 # Launches safe mode, waits for the page, screenshots the window, prints memory
 # for the whole process tree, and kills it. Works for either engine build.
@@ -12,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Drawing
 New-Item -ItemType Directory -Force $DataDir | Out-Null
 $env:WHATSAPP_RS_DATA_DIR = $DataDir
-$env:WHATSAPP_RS_INSTANCE_PORT = '47998'
+$env:WHATSAPP_RS_INSTANCE_PORT = $InstancePort
 if (-not $env:RUST_LOG) { $env:RUST_LOG = 'warn,servo=info,whatsapp_rs=info' }
 # stderr carries the engine log (RUST_LOG) and the app's own load-status lines.
 $p = Start-Process -FilePath $Exe -ArgumentList '--safe' -WorkingDirectory (Split-Path $Exe) -PassThru `
@@ -52,8 +56,9 @@ do {
 $tree = $all | Where-Object { $set -contains $_.ProcessId }
 "tree: $($tree.Count) processes, working set $([math]::Round(($tree | Measure-Object WorkingSetSize -Sum).Sum/1MB,1)) MB, private $([math]::Round(($tree | Measure-Object PrivatePageCount -Sum).Sum/1MB,1)) MB"
 foreach ($x in $tree) { "    $($x.Name) pid=$($x.ProcessId) ws=$([math]::Round($x.WorkingSetSize/1MB,1))" }
-foreach ($x in $tree) { Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue }
+if (-not $Keep) { foreach ($x in $tree) { Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue } }
 Start-Sleep -Milliseconds 500
 "--- stderr (engine log), last 40 lines ---"
 Get-Content "$OutDir\$Tag.err" -Tail 40 -ErrorAction SilentlyContinue | ForEach-Object { $_.Substring(0, [Math]::Min(240, $_.Length)) }
-"killed; data dir now: " + ((Get-ChildItem $DataDir -Recurse -File | Measure-Object Length -Sum).Sum / 1KB) + " KB in " + ((Get-ChildItem $DataDir -Recurse -File | Measure-Object).Count) + " files"
+if ($Keep) { "left running as pid $($p.Id)" } else { "killed" }
+"data dir now: " + ((Get-ChildItem $DataDir -Recurse -File | Measure-Object Length -Sum).Sum / 1KB) + " KB in " + ((Get-ChildItem $DataDir -Recurse -File | Measure-Object).Count) + " files"
