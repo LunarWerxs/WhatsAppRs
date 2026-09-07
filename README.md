@@ -108,6 +108,18 @@ Three classes from the C# original do not exist here, because the app owns its o
 cargo build --release
 ```
 
+That is safe mode on the OS webview. Safe mode on Servo (DECISIONS.md #8 and #12: our own engine,
+the same on every OS, presenting as Firefox) is the `servo` feature, built against the sibling
+checkout at `../servo` on its `cache-storage-complete` branch:
+
+```
+pwsh -File tools/build-servo.ps1
+```
+
+It reproduces the environment Servo's `mach` sets up on Windows (SERVO_BUILD.md), uses the
+`servo` profile (no LTO; an engine's worth of code), and copies the ANGLE DLLs beside
+`target/servo/whatsapp.exe`.
+
 Linux build dependencies: `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
 librsvg2-dev libsoup-3.0-dev pkg-config`.
 

@@ -90,6 +90,23 @@ app icon. Measured after: **20.2 MB working set, 3.0 MB private**, against 19.1 
 restyle. His doubt was right; the styling cost one megabyte. "Dark mode is important" (his words
 the same day) is why the theme follows Windows and why both were screenshotted.
 
+**12. Safe mode's engine must be the same engine on every OS, and it must be ours to run:
+Servo, embedded. No Edge, no Chrome, no Safari identity.** Said twice today, the second time in
+anger, after safe mode showed up on his phone as "Microsoft Edge": the OS webview design (#7) means
+Edge's engine on Windows, Safari's on Mac and Linux, and the phone names the device after whichever
+it sees. He rejected the shortcut of presenting the OS engine as Chrome ("I don't want it using a
+Google..."), and restated the requirement: an open-source engine from GitHub that we build and run
+ourselves, presenting as something on WhatsApp's allowed list. That is #8, which was ruled yesterday
+and never carried into the app: the Servo patches got built, safe mode stayed on WebView2.
+Consequence, in work now: `src/servo_view.rs` embeds our Servo build behind `--features servo`
+(`tools/build-servo.ps1`), presenting as Firefox, identical on Windows, macOS and Linux. The
+WebView2 path stays only as the non-`servo` build until Servo mode is proven, then it goes.
+Measured today, embedded: the app's own window with Servo inside draws WhatsApp's real login
+page with a live QR, presenting as Firefox 143, one process, 442 MB working set (FINDINGS.md,
+"Safe mode on Servo, embedded"). What it still needs is his phone: link it, and the device list
+should read Firefox, not Edge. The cost he accepted in #10 stands: about 440 to 465 MB against
+375 MB for the OS webview.
+
 ## Standing consequence of 1 + 2 + 3
 
 The honest tension to keep visible: there is no embeddable engine in 2026 that renders

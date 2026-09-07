@@ -7,6 +7,11 @@
 use muda::{Menu, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
+/// Fixed menu ids, so a handler installed before the tray exists can still tell
+/// the two items apart.
+pub const OPEN_ID: &str = "open";
+pub const QUIT_ID: &str = "quit";
+
 pub const ICON_32: &[u8] = include_bytes!("../assets/icon_32.rgba");
 pub const ICON_256: &[u8] = include_bytes!("../assets/icon_256.rgba");
 
@@ -26,8 +31,8 @@ pub fn window_image() -> Option<tao::window::Icon> {
 }
 
 pub fn build() -> Option<Tray> {
-    let open = MenuItem::new("Open WhatsApp", true, None);
-    let quit = MenuItem::new("Quit WhatsApp", true, None);
+    let open = MenuItem::with_id(OPEN_ID, "Open WhatsApp", true, None);
+    let quit = MenuItem::with_id(QUIT_ID, "Quit WhatsApp", true, None);
     let open_id = open.id().clone();
     let quit_id = quit.id().clone();
 

@@ -31,6 +31,8 @@ mod light;
 mod mode;
 mod notify;
 mod paths;
+#[cfg(feature = "servo")]
+mod servo_view;
 mod shortcut;
 mod single_instance;
 mod tray;
@@ -46,7 +48,12 @@ fn main() {
         return;
     };
 
+    // Safe mode's engine: our own Servo build when compiled with `--features servo`
+    // (DECISIONS.md #8), otherwise the operating system's webview.
     let result = match mode {
+        #[cfg(feature = "servo")]
+        mode::Mode::Safe => servo_view::run().map_err(|e| e.to_string()),
+        #[cfg(not(feature = "servo"))]
         mode::Mode::Safe => webview::run().map_err(|e| e.to_string()),
         mode::Mode::Light => light::run().map_err(|e| e.to_string()),
     };

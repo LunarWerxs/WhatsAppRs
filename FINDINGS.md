@@ -257,6 +257,45 @@ The picker still says "about 12 MB" for light mode. That figure was the standalo
 binary measures 27.5 MB working set with 3.7 MB private. Whether the picker text changes is the
 owner's call.
 
+## Servo presenting as Firefox, measured 2026-09-07
+
+The fork's `servoshell` (branch `cache-storage-complete`), headless, `--config-dir` set, the three
+WhatsApp prefs on, and `-u "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:143.0) Gecko/20100101
+Firefox/143.0"`: WhatsApp serves the real login page (heading, the three steps, the phone-number
+login link, the create-account form). No "update Firefox" gate this time; the earlier survey hit it
+because Servo's default string carries an old Firefox version. WhatsApp's JS logs one
+`[page load] validation failed (page-load-validation)` error and carries on. The QR square was still
+blank at the moment `-o` captured (about five seconds in); whether it fills is what the embedded
+build answers. Working set of that headless run was not measured; the earlier figures are #10 in
+DECISIONS.md.
+
+## Safe mode on Servo, embedded, measured 2026-09-07
+
+`tools/build-servo.ps1` then `tools/safe-drive.ps1` (scratch profile, 40 s wait). The app's own
+window, Servo inside it, presenting as Firefox 143:
+
+| what | result |
+| --- | --- |
+| page | WhatsApp's real login page, **QR drawn** (`servo-safe.png`); load status Started, HeadParsed, Complete in the engine log |
+| processes | **1** |
+| working set / private | **441.9 MB / 533.5 MB** |
+| binary | 137 MB exe plus `libEGL.dll` and `libGLESv2.dll` beside it |
+| profile after 40 s | 31 files, 4.5 MB under `<data>/servo/` (IndexedDB, client storage, cache) |
+
+Two things it took to get there, each a silent failure until the engine log was captured:
+
+- **rustls has no crypto provider unless the embedder picks one.** The network thread panicked on
+  its first TLS handshake ("Could not automatically determine the process-level CryptoProvider")
+  and the window stayed white at 77 MB. `rustls` with `aws-lc-rs` in Cargo.toml plus
+  `install_default()` at startup, the same choice servoshell makes.
+- **Two crates linking the native SQLite.** Servo's net crate wanted `libsqlite3-sys` 0.36 through
+  rusqlite 0.38; light mode's session store wants 0.37. Cargo allows one. The fork now pins rusqlite
+  0.39 with a vendored `sea-query-rusqlite` (no release on 0.39 yet), commit `42ef2253c`.
+
+Noise in the log that is not a fault: "Empty hit test result" and "Unknown pipeline" while the
+mouse moves over the window before the page exists; one WebSocket `ResetWithoutClosingHandshake`,
+which is WhatsApp's QR socket cycling.
+
 ## Light mode's chat window, measured 2026-09-07
 
 Instrument: `tools/light-drive.ps1`. Plain Win32 controls (list box, two edit boxes, a button) and

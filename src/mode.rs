@@ -136,16 +136,24 @@ fn ask() -> Option<Mode> {
 
     let title = wide("WhatsApp");
     let instruction = wide("How should WhatsApp run?");
-    let content = wide(
+    let safe_engine = if cfg!(feature = "servo") {
+        "Safe mode opens WhatsApp's real website in Servo, an open-source browser \
+         engine built into this app, the same one on every operating system. To \
+         WhatsApp that is a browser, so it breaks no rule and your account is never \
+         at risk."
+    } else {
         "Safe mode opens WhatsApp's real website in the browser engine already built \
          into Windows. That is exactly what using Firefox or Chrome would be, so it \
-         breaks no rule and your account is never at risk.\n\n\
+         breaks no rule and your account is never at risk."
+    };
+    let content = wide(&format!(
+        "{safe_engine}\n\n\
          Light mode talks to WhatsApp directly with no browser, which is why it is so \
          much smaller. But it does that using knowledge obtained by reverse engineering \
          WhatsApp's apps, which their Terms of Service forbid. Accounts have been \
          permanently banned for it, and there is no appeal.\n\n\
          If in doubt, choose Safe.",
-    );
+    ));
     let footer = wide("You can change this later by starting the app with --choose.");
 
     let mut config = TASKDIALOGCONFIG {

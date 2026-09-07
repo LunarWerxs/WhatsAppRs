@@ -183,6 +183,28 @@ Verified 2026-09-07 (session two), all by running it, instruments in `tools/`:
    "[attachment]"), no read receipts sent, no typing indicators, no group member list, no
    bubble tails, time sits on its own line under the text rather than floating right of the
    last line, fonts are sized at launch DPI only, Shift+Enter does not insert a newline.
+3b. **Safe mode on Servo, in progress (DECISIONS.md #12, the ruling that matters most now).**
+   Michael saw safe mode listed as "Microsoft Edge" on his phone and ruled, angrily, that the
+   engine must be the same on every OS and ours to run: Servo, embedded, presenting as Firefox.
+   Done so far: `src/servo_view.rs` (winit window, Servo embedding API, input forwarding,
+   toasts via the delegate, close-to-tray, geometry, single instance), the `servo` Cargo
+   feature with a `servo` build profile (no LTO), `tools/build-servo.ps1` (mach's Windows
+   environment, ANGLE DLLs copied beside the exe), and in the Servo fork: rusqlite moved to
+   0.39 with a vendored `third_party/sea-query-rusqlite`, because light mode's session store
+   links the same native SQLite and Cargo allows one copy (fork commit `42ef2253c`), and
+   `rustls` with `aws-lc-rs` installed at startup, without which Servo's network thread
+   panics silently. **Proven: the embedded build draws WhatsApp's real login page with a
+   live QR, one process, 442 MB working set** (FINDINGS.md). NOT yet proven: the phone
+   listing it as Firefox (needs Michael to link), login persisting across restarts
+   (cookies flush on a clean quit through the tray menu; IndexedDB and Cache Storage write
+   live under `<data>/servo/`), clipboard paste (no clipboard delegate yet), the toast path
+   through Servo's Notification delegate, Mac and Linux builds. Build:
+   `tools/build-servo.ps1` under `fairjob.ps1`, output `target/servo/whatsapp.exe` with the
+   two ANGLE DLLs beside it; do not run it beside a normal `cargo build`, the target lock
+   serialises them. Test: `tools/safe-drive.ps1`, which captures the engine log, the thing
+   that found both silent failures.
+   A leftover: `target/release/whatsapp.running.exe` is his running instance's binary,
+   renamed out of the way so a build could write; delete it once he has quit that instance.
 4. Optional: submit the four Servo commits upstream. They are exported as patch files in
    `servo-patches/` with a ready-to-paste PR description. Needs his GitHub account.
 5. Nothing is committed: the repo has no commits yet (`git log` is empty). Nothing has been

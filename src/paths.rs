@@ -8,8 +8,12 @@ const APP_DIR: &str = "WhatsAppRs";
 /// The app's data directory. The webview profile (message history, login session)
 /// lives inside this, so it is the one directory that matters for footprint.
 pub fn data_dir() -> PathBuf {
-    let base = platform_base();
-    let dir = base.join(APP_DIR);
+    // WHATSAPP_RS_DATA_DIR: a separate profile for a test instance, so the
+    // tools can run the app beside a real, logged-in one without touching it.
+    let dir = match std::env::var_os("WHATSAPP_RS_DATA_DIR") {
+        Some(p) if !p.is_empty() => PathBuf::from(p),
+        _ => platform_base().join(APP_DIR),
+    };
     // Best effort. If this fails the webview falls back to its own default and
     // the app still works, so it is not worth aborting over.
     let _ = std::fs::create_dir_all(&dir);

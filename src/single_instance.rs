@@ -22,7 +22,13 @@ pub enum Instance {
 }
 
 pub fn acquire() -> Instance {
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT);
+    // WHATSAPP_RS_INSTANCE_PORT: a test instance takes its own lock, so it can
+    // run beside the real one instead of just waking it up.
+    let port = std::env::var("WHATSAPP_RS_INSTANCE_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(PORT);
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
     match TcpListener::bind(addr) {
         Ok(listener) => {
             // Non-blocking so the event loop can poll without stalling.

@@ -48,6 +48,32 @@ qrcode = "0.14"
 # Light mode raises its own notifications; safe mode lets the webview do it.
 notify-rust = "4.18"
 
+# Safe mode on Servo (DECISIONS.md #8): our own build of the engine, the same on
+# every OS, from the sibling checkout with the Cache Storage patches. Opt-in
+# feature because the build is heavy; tools/build-servo.ps1 drives it.
+servo = { path = "../servo/components/servo", optional = true, default-features = false, features = [
+    "bundled",
+    "clipboard",
+    "js_jit",
+    "webcrypto",
+] }
+winit = { version = "0.30.13", optional = true }
+euclid = { version = "0.22", optional = true }
+url = { version = "2.5", optional = true }
+keyboard-types = { version = "0.8.3", optional = true }
+# Servo's TLS (rustls) leaves the crypto provider to the embedder; without one the
+# network thread panics on its first request. Same choice as servoshell.
+rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
+
+[features]
+servo = ["dep:servo", "dep:winit", "dep:euclid", "dep:url", "dep:keyboard-types", "dep:rustls"]
+
+# Servo's SQLite wrapper and light mode's session store must link the same native
+# SQLite. The fork pins rusqlite 0.39 for that; its query-builder adapter has no
+# release on 0.39 yet, so the fork vendors a one-line-changed copy, patched here too.
+[patch.crates-io]
+sea-query-rusqlite = { path = "../servo/third_party/sea-query-rusqlite" }
+
 # Windows-only: raw ICoreWebView2, needed to grant the Notifications permission
 # that WebView2 otherwise auto-denies, and to set the AppUserModelID that Windows
 # requires before it will render a toast at all.
@@ -56,6 +82,9 @@ notify-rust = "4.18"
 [target.'cfg(target_os = "windows")'.dependencies]
 webview2-com = "0.38.2"
 windows-core = "0.61"
+# Servo on Windows renders through ANGLE (libEGL.dll, libGLESv2.dll beside the exe),
+# never WGL; servoshell sets the same.
+servo = { path = "../servo/components/servo", optional = true, default-features = false, features = ["no-wgl"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.61"
@@ -103,4 +132,15 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
+strip = true
+
+# The Servo build: an engine's worth of code, so no whole-program LTO and no
+# single codegen unit (hours and tens of GB otherwise), and speed over size, as
+# Servo's own release profile chooses. Output lands in target/servo/.
+[profile.servo]
+inherits = "release"
+opt-level = 3
+lto = false
+codegen-units = 16
+panic = "unwind"
 strip = true

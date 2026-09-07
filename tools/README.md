@@ -13,6 +13,8 @@ Python 3 with `websocket-client` on PATH. Run from anywhere; paths are script-re
 | `toast-db.py [N]` | The last N toasts Windows accepted, with the app identity each was filed under. Reads a copy of `wpndatabase.db`. This is the ground truth; the page's own "displayed" report is not. |
 | `cdp-notify.py PORT page\|sw\|both` | Requests the permission and fires the notification(s) in the page; prints the page's view. |
 | `cdp-eval.py PORT file.js` | Evaluates any awaited expression in the page. `survey.js` is the one that counted WhatsApp Web's notification API calls. |
+| `build-servo.ps1 [-Check]` | Builds the app with safe mode on Servo (`--features servo`, `--profile servo`) in the environment Servo's `mach` would set up, and copies the ANGLE DLLs beside `target/servo/whatsapp.exe`. Slow: it compiles the engine. |
+| `safe-drive.ps1 [-Exe path] [-Wait 25]` | Launches safe mode on a scratch profile and its own instance lock (so a real logged-in instance is untouched), screenshots the window, prints the process tree's memory, kills it. Works for either engine build. |
 | `light-drive.ps1 -Mode demo\|pair [-Theme light\|dark]` | Light mode's window. `demo` opens it with sample chats and no network, moves it clear of overlays, clicks the first chat with a real mouse click (after printing what is under the cursor), types into the send box, presses Enter, screenshots before and after, and prints memory. `pair` opens the real thing as far as the QR (never scanned), screenshots it, and kills it. `-Theme` forces a palette through `WHATSAPP_RS_THEME`. |
 
 Two things learned building these, so nobody rebuilds the wrong instrument:
