@@ -213,7 +213,11 @@ Verified 2026-09-07 (session two), all by running it, instruments in `tools/`:
    (`441e31675`, exported as `servo-patches/0005-*`), exposed on Window and **WorkerNavigator**.
    Twelve engine prefs that WhatsApp needs are now set by name, page-side polyfills cover
    `requestIdleCallback`, and the page's console is finally forwarded to stderr.
-   **What is NOT verified: that the chat list now loads.** That needs Michael to scan the QR again.
+   **RESOLVED 2026-09-07: the chat list loads.** Two more engine gaps stood behind the locks one:
+   IndexedDB cursors could not advance, and `IDBIndex` had no query methods at all, so WhatsApp's
+   `index.getAll(...)` threw. Both implemented (`4acad3532`, `df26942dc`), and the app now renders
+   the real chat list. Superseded note follows.
+   **What was NOT verified at the time:** That needs Michael to scan the QR again.
    The app is running on his real profile with `WHATSAPP_RS_PROBE=1`, and its log
    (`scratchpad/session.err`) will capture the next login attempt.
    **The next blocker was fixed too, without waiting for it to bite:** `IDBCursor` had no

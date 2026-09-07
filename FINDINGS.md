@@ -354,6 +354,36 @@ store:
 
 `update()` and `delete()` on a cursor are still unimplemented.
 
+## WhatsApp Web fully loaded on Servo, 2026-09-07
+
+After the QR, the page reached "Loading your chats" and stopped there. Three engine gaps in a row
+caused it, each hidden behind the last:
+
+1. **Web Locks.** WhatsApp's backend worker calls `navigator.locks.request()` unguarded on its first
+   line, before it registers its message handler. Servo had no Web Locks, so the worker threw, went
+   silent, and the page waited on it forever. Implemented in the fork (`441e31675`). After this the
+   worker starts and replies, and the page gets past the QR.
+2. **IndexedDB cursors could not move.** `continue`, `advance` and `continuePrimaryKey` were absent,
+   so a cursor read one record and stopped (`4acad3532`).
+3. **IDBIndex had no methods at all.** `getAll` and `openCursor` on an index threw
+   "is not a function", which is exactly what the page's own error handler reported once the
+   embedder started forwarding the console. Implemented, along with a real bug in Servo's cursor
+   iteration that left an index cursor's primary key undefined (`df26942dc`).
+
+With those, **the chat list renders**: real conversations, avatars, previews and unread counts
+(`chats-loaded.png`). One process, about 1.0 GB working set with a fully synced account, which is
+substantially more than the 442 MB measured on the logged-out screen and is worth its own look.
+
+The instrument that made this tractable was forwarding the page's console and capturing unhandled
+rejections **with their message**, not just a stack. The first attempt logged only stacks and named
+nothing; adding `name: message` turned a day of guessing into two lines that said exactly what was
+missing.
+
+Still open after all this: **OPFS** is absent and cannot be shimmed cheaply, and one
+`DataError: Provided data is inadequate.` rejection still appears during load without visibly
+breaking anything. `IDBCursor.update`/`delete` remain unimplemented, and index queries scan the
+whole object store, which will not scale to a large mailbox.
+
 ## Storage persistence on Servo, measured 2026-09-07
 
 Written in one run, read back in the next, with a clean shutdown between

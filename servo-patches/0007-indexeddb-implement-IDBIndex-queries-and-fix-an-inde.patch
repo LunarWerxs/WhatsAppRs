@@ -1,0 +1,741 @@
+From df26942dca7e1c07d5cc788c1a9c679a1c3a9a7e Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 14:14:43 -0500
+Subject: [PATCH] indexeddb: implement IDBIndex queries, and fix an index
+ cursor losing its position
+
+IDBIndex had no methods at all: get, getKey, getAll, getAllKeys, count,
+openCursor and openKeyCursor were commented out of the WebIDL. web.whatsapp.com
+calls getAll and openCursor on an index while loading a logged-in session, got
+"_.getAll is not a function", and hung on its loading screen forever.
+
+The backend cannot answer these. Its schema has index_data and unique_index_data
+tables, but nothing ever writes them: index entries are only ever deleted. Nor
+could the backend compute them, since it stores values as opaque structured-clone
+blobs and cannot evaluate a key path. So the records are derived in script, where
+the values can be deserialized: read the object store, evaluate the index's key
+path over each value, drop records the path does not apply to, expand multiEntry
+arrays, sort into index order, and keep the first record per key for a unique
+index. Correct, and linear in the size of the store; real index tables in the
+backend are the destination, this is the road to it.
+
+Cursors over an index reuse that: the records are synthesized on every step, not
+just the first, because a cursor that forgot its index stopped after one record.
+
+Fixes a bug in iterate_cursor along the way. Step 9.4 wrote the found record's
+primary key straight to the cursor and never updated the local object store
+position that step 11 later stores, so the running value was always stale: an
+index cursor reported an undefined primaryKey and skipped every record that
+shared an index key with its predecessor.
+
+Verified at runtime over a four-record store with two indexes: getAll, getAllKeys
+and count return the right rows, a multiEntry index matches on each array
+element, and an index cursor walks Berlin/2, Cairo/4, Oslo/1, Oslo/3 in index
+order with the right primary keys. With this, web.whatsapp.com finishes loading
+and renders the chat list.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  31 +-
+ components/script/dom/indexeddb/idbindex.rs   | 370 +++++++++++++++++-
+ components/script/dom/indexeddb/idbrequest.rs | 111 ++++--
+ .../script_bindings/codegen/Bindings.conf     |   2 +-
+ .../script_bindings/webidls/IDBIndex.webidl   |  22 +-
+ 5 files changed, 489 insertions(+), 47 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 8cf45b87e..67e8f7ce9 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -26,7 +26,7 @@ use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+ use crate::dom::bindings::structuredclone;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::bindings::codegen::Bindings::IDBIndexBinding::IDBIndexMethods;
+-use crate::dom::indexeddb::idbindex::IDBIndex;
++use crate::dom::indexeddb::idbindex::{IDBIndex, IndexQueryKind, IndexQueryParam};
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbrequest::IDBRequest;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+@@ -215,19 +215,40 @@ impl IDBCursor {
+             count,
+         };
+ 
++        // A cursor over an index has to keep asking through that index on every
++        // step, not just the first: the backend returns the store's records and
++        // the index reinterprets them. Losing this on continue() makes a cursor
++        // stop after its first record.
++        let index_param = match &self.source {
++            ObjectStoreOrIndex::Index(index) => Some(IndexQueryParam {
++                index: Trusted::new(&**index),
++                range: self.range.clone(),
++                count: None,
++                kind: IndexQueryKind::Cursor,
++            }),
++            ObjectStoreOrIndex::ObjectStore(_) => None,
++        };
++        // An index query scans the whole store; a store cursor keeps its own range.
++        let key_range = if index_param.is_some() {
++            IndexedDBKeyRange::default()
++        } else {
++            range
++        };
++
+         // Step: Run the steps to asynchronously execute a request with the cursor's
+         // source as source, the steps to iterate a cursor as operation, and request.
+-        IDBRequest::execute_async(
++        IDBRequest::execute_async_indexed(
+             cx,
+             &store,
+             |callback| {
+                 AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
+                     callback,
+-                    key_range: range,
++                    key_range,
+                 })
+             },
+             Some(request),
+             Some(iteration_param),
++            index_param,
+         )?;
+         Ok(())
+     }
+@@ -462,7 +483,7 @@ pub(crate) fn iterate_cursor(
+     let mut position = cursor.position.borrow().clone();
+ 
+     // Step 7. Let object store position be cursor’s object store position.
+-    let object_store_position = cursor.object_store_position.borrow().clone();
++    let mut object_store_position = cursor.object_store_position.borrow().clone();
+ 
+     // Step 8. If count is not given, let count be 1.
+     let mut count = count.unwrap_or(1);
+@@ -671,7 +692,7 @@ pub(crate) fn iterate_cursor(
+ 
+                 // Step 9.4. If source is an index, let object store position be found record’s value.
+                 if matches!(source, ObjectStoreOrIndex::Index(_)) {
+-                    cursor.set_object_store_position(Some(found_record.primary_key.clone()));
++                    object_store_position = Some(found_record.primary_key.clone());
+                 }
+ 
+                 // Step 9.5. Decrease count by 1.
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index ba0353010..2ce285f33 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -1,21 +1,41 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++use std::cmp::Ordering;
++
+ use dom_struct::dom_struct;
+ use js::context::JSContext;
+ use js::conversions::ToJSValConvertible;
+-use js::gc::MutableHandleValue;
++use js::gc::{HandleValue, MutableHandleValue};
++use js::jsval::{DoubleValue, JSVal, UndefinedValue};
+ use script_bindings::cell::DomRefCell;
+ use script_bindings::codegen::GenericBindings::IDBIndexBinding::IDBIndexMethods;
+ use script_bindings::codegen::GenericBindings::IDBTransactionBinding::IDBTransactionMode;
+-use script_bindings::error::{Error, ErrorResult};
++use script_bindings::error::{Error, ErrorResult, Fallible};
++use script_bindings::inheritance::Castable;
+ use script_bindings::reflector::{Reflector, reflect_dom_object};
+ use script_bindings::str::DOMString;
++use storage_traits::indexeddb::{
++    AsyncOperation, AsyncReadOnlyOperation, IndexedDBKeyRange, IndexedDBKeyType, IndexedDBRecord,
++};
+ 
++use crate::dom::bindings::codegen::Bindings::IDBCursorBinding::IDBCursorDirection;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::root::{Dom, DomRoot};
++use crate::dom::bindings::structuredclone;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::idbobjectstore::KeyPath;
++use crate::dom::indexeddb::idbcursor::{IDBCursor, IterationParam, ObjectStoreOrIndex};
++use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
++use crate::dom::indexeddb::idbrequest::IDBRequest;
++use crate::dom::indexeddb::idbtransaction::IDBTransaction;
++use crate::dom::indexeddb::key::key_type_to_jsval;
++use crate::dom::indexeddb::key::{
++    ConversionResult, EvaluationResult, convert_value_to_key, convert_value_to_key_range,
++    evaluate_key_path_on_value,
++};
+ 
+ #[dom_struct]
+ pub(crate) struct IDBIndex {
+@@ -68,6 +88,297 @@ impl IDBIndex {
+     }
+ }
+ 
++/// What an index query should hand back once its records have been gathered.
++#[derive(Clone, Copy, MallocSizeOf, PartialEq)]
++pub(crate) enum IndexQueryKind {
++    /// The referenced value of the first matching record.
++    Get,
++    /// The primary key of the first matching record.
++    GetKey,
++    /// Every matching referenced value.
++    GetAll,
++    /// Every matching primary key.
++    GetAllKeys,
++    /// How many records match.
++    Count,
++    /// Feed the records to a cursor instead of answering directly.
++    Cursor,
++}
++
++/// Everything the reply handler needs to turn a full store scan into the answer
++/// to one index query.
++#[derive(Clone, JSTraceable, MallocSizeOf)]
++pub(crate) struct IndexQueryParam {
++    pub(crate) index: Trusted<IDBIndex>,
++    #[no_trace]
++    pub(crate) range: IndexedDBKeyRange,
++    pub(crate) count: Option<u32>,
++    #[no_trace]
++    pub(crate) kind: IndexQueryKind,
++}
++
++impl IndexQueryParam {
++    /// Build the JavaScript answer for a non-cursor index query from the records
++    /// that matched, honouring the query's `count` limit.
++    pub(crate) fn answer(
++        &self,
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        records: &[IndexedDBRecord],
++        mut answer: MutableHandleValue,
++    ) -> Result<(), Error> {
++        let limit = match self.count {
++            Some(0) | None => records.len(),
++            Some(count) => (count as usize).min(records.len()),
++        };
++
++        match self.kind {
++            IndexQueryKind::Get => match records.first() {
++                Some(record) => read_value(cx, global, record, answer)?,
++                // A query that matches nothing resolves with undefined, not an error.
++                None => answer.set(UndefinedValue()),
++            },
++            IndexQueryKind::GetKey => match records.first() {
++                Some(record) => key_type_to_jsval(cx, &record.primary_key, answer),
++                None => answer.set(UndefinedValue()),
++            },
++            IndexQueryKind::GetAll => {
++                rooted!(&in(cx) let mut values = vec![JSVal::default(); limit]);
++                for (i, record) in records.iter().take(limit).enumerate() {
++                    read_value(cx, global, record, values.handle_mut_at(i))?;
++                }
++                values.to_jsval(cx, answer);
++            },
++            IndexQueryKind::GetAllKeys => {
++                rooted!(&in(cx) let mut keys = vec![JSVal::default(); limit]);
++                for (i, record) in records.iter().take(limit).enumerate() {
++                    key_type_to_jsval(cx, &record.primary_key, keys.handle_mut_at(i));
++                }
++                keys.to_jsval(cx, answer);
++            },
++            IndexQueryKind::Count => answer.set(DoubleValue(records.len() as f64)),
++            IndexQueryKind::Cursor => unreachable!("a cursor query never answers directly"),
++        }
++        Ok(())
++    }
++}
++
++/// Deserialize a record's stored value into a JavaScript value.
++fn read_value(
++    cx: &mut JSContext,
++    global: &GlobalScope,
++    record: &IndexedDBRecord,
++    answer: MutableHandleValue,
++) -> Result<(), Error> {
++    let data = postcard::from_bytes(&record.value).map_err(|_| Error::Data(None))?;
++    structuredclone::read(cx, global, data, answer).map(|_ports| ())
++}
++
++impl IDBIndex {
++    fn transaction(&self) -> DomRoot<IDBTransaction> {
++        self.object_store.transaction()
++    }
++
++    /// The checks every index query shares.
++    fn check_usable(&self) -> ErrorResult {
++        self.object_store.verify_not_deleted()?;
++        let transaction = self.transaction();
++        if !transaction.is_active() || !transaction.is_usable() {
++            return Err(Error::TransactionInactive(None));
++        }
++        Ok(())
++    }
++
++    /// Run an index query.
++    ///
++    /// Servo's IndexedDB backend keeps no index entries: its `index_data` table is
++    /// created and cleared but never written, so there is nothing to look up. Until
++    /// the backend maintains real indexes, the records are derived here instead, by
++    /// reading the object store and evaluating this index's key path over the
++    /// values. That is correct but linear in the size of the store, so it is a
++    /// stepping stone rather than the destination.
++    fn query(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        kind: IndexQueryKind,
++        count: Option<u32>,
++        iteration_param: Option<IterationParam>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.check_usable()?;
++
++        // The range applies to this index's keys, not to the store's.
++        let range = convert_value_to_key_range(cx, query, Some(false))?;
++
++        let index_param = IndexQueryParam {
++            index: Trusted::new(self),
++            range,
++            count,
++            kind,
++        };
++
++        // Scan the whole store; the reply handler narrows it down.
++        IDBRequest::execute_async_indexed(
++            cx,
++            &self.object_store,
++            |callback| {
++                AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate {
++                    callback,
++                    key_range: IndexedDBKeyRange::default(),
++                })
++            },
++            None,
++            iteration_param,
++            Some(index_param),
++        )
++    }
++
++    fn open_cursor(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++        key_only: bool,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.check_usable()?;
++        let range = convert_value_to_key_range(cx, query, Some(false))?;
++
++        let cursor = if key_only {
++            IDBCursor::new(
++                cx,
++                &self.global(),
++                &self.transaction(),
++                direction,
++                false,
++                ObjectStoreOrIndex::Index(Dom::from_ref(self)),
++                range.clone(),
++                key_only,
++            )
++        } else {
++            DomRoot::upcast(IDBCursorWithValue::new(
++                cx,
++                &self.global(),
++                &self.transaction(),
++                direction,
++                false,
++                ObjectStoreOrIndex::Index(Dom::from_ref(self)),
++                range.clone(),
++                key_only,
++            ))
++        };
++
++        let iteration_param = IterationParam {
++            cursor: Trusted::new(&cursor),
++            key: None,
++            primary_key: None,
++            count: None,
++        };
++
++        self.query(cx, query, IndexQueryKind::Cursor, None, Some(iteration_param))
++            .inspect(|request| cursor.set_request(request))
++    }
++
++    /// Turn the store's records into this index's records: evaluate the key path
++    /// over each value, drop the ones it does not apply to, expand `multiEntry`
++    /// arrays, and sort into index order.
++    ///
++    /// <https://w3c.github.io/IndexedDB/#index-referenced-value>
++    pub(crate) fn records_for(
++        &self,
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        store_records: Vec<IndexedDBRecord>,
++    ) -> Vec<IndexedDBRecord> {
++        let mut out: Vec<IndexedDBRecord> = Vec::new();
++
++        for record in store_records {
++            rooted!(&in(cx) let mut value = UndefinedValue());
++            let read = postcard::from_bytes(&record.value)
++                .map_err(|_| ())
++                .and_then(|data| {
++                    structuredclone::read(cx, global, data, value.handle_mut()).map_err(|_| ())
++                });
++            if read.is_err() {
++                continue;
++            }
++
++            rooted!(&in(cx) let mut key_value = UndefinedValue());
++            let evaluated = evaluate_key_path_on_value(
++                cx,
++                value.handle(),
++                &self.key_path,
++                key_value.handle_mut(),
++            );
++            let Ok(EvaluationResult::Success) = evaluated else {
++                // A record whose value has no key for this index is simply not in it.
++                continue;
++            };
++
++            // multiEntry turns an array key into one index record per element.
++            let keys = if self.multi_entry {
++                match extract_multi_entry_keys(cx, key_value.handle()) {
++                    Some(keys) => keys,
++                    None => continue,
++                }
++            } else {
++                match convert_value_to_key(cx, key_value.handle(), None) {
++                    Ok(ConversionResult::Valid(key)) => vec![key],
++                    _ => continue,
++                }
++            };
++
++            for key in keys {
++                out.push(IndexedDBRecord {
++                    key,
++                    primary_key: record.primary_key.clone(),
++                    value: record.value.clone(),
++                });
++            }
++        }
++
++        // Index order is by index key, then by primary key.
++        out.sort_by(|a, b| {
++            a.key
++                .partial_cmp(&b.key)
++                .unwrap_or(Ordering::Equal)
++                .then_with(|| {
++                    a.primary_key
++                        .partial_cmp(&b.primary_key)
++                        .unwrap_or(Ordering::Equal)
++                })
++        });
++
++        // A unique index keeps only the first record for each key.
++        if self.unique {
++            out.dedup_by(|a, b| a.key == b.key);
++        }
++        out
++    }
++}
++
++/// The elements of an array key, for a `multiEntry` index. Non-array keys stay
++/// single, and invalid entries are dropped rather than failing the record.
++fn extract_multi_entry_keys(
++    cx: &mut JSContext,
++    value: HandleValue,
++) -> Option<Vec<IndexedDBKeyType>> {
++    if let Ok(ConversionResult::Valid(IndexedDBKeyType::Array(entries))) =
++        convert_value_to_key(cx, value, None)
++    {
++        let mut keys: Vec<IndexedDBKeyType> = Vec::new();
++        for entry in entries {
++            if !keys.contains(&entry) {
++                keys.push(entry);
++            }
++        }
++        return Some(keys);
++    }
++    match convert_value_to_key(cx, value, None) {
++        Ok(ConversionResult::Valid(key)) => Some(vec![key]),
++        _ => None,
++    }
++}
++
+ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-name>
+     fn Name(&self) -> DOMString {
+@@ -145,6 +456,61 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+     }
+ 
+     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-keypath>
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get>
++    fn Get(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.query(cx, query, IndexQueryKind::Get, None, None)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getkey>
++    fn GetKey(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.query(cx, query, IndexQueryKind::GetKey, None, None)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getall>
++    fn GetAll(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.query(cx, query, IndexQueryKind::GetAll, count, None)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getallkeys>
++    fn GetAllKeys(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        count: Option<u32>,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.query(cx, query, IndexQueryKind::GetAllKeys, count, None)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-count>
++    fn Count(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
++        self.query(cx, query, IndexQueryKind::Count, None, None)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-opencursor>
++    fn OpenCursor(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.open_cursor(cx, query, direction, false)
++    }
++
++    /// <https://w3c.github.io/IndexedDB/#dom-idbindex-openkeycursor>
++    fn OpenKeyCursor(
++        &self,
++        cx: &mut JSContext,
++        query: HandleValue,
++        direction: IDBCursorDirection,
++    ) -> Fallible<DomRoot<IDBRequest>> {
++        self.open_cursor(cx, query, direction, true)
++    }
++
+     fn KeyPath(&self, cx: &mut JSContext, retval: MutableHandleValue) {
+         match &self.key_path {
+             KeyPath::String(string) => {
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 975fe2ffa..512ba58b8 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -36,6 +36,7 @@ use crate::dom::eventtarget::EventTarget;
+ use crate::dom::globalscope::GlobalScope;
+ use crate::dom::indexeddb::idbcursor::{IterationParam, iterate_cursor};
+ use crate::dom::indexeddb::idbcursorwithvalue::IDBCursorWithValue;
++use crate::dom::indexeddb::idbindex::{IndexQueryKind, IndexQueryParam};
+ use crate::dom::indexeddb::idbobjectstore::IDBObjectStore;
+ use crate::dom::indexeddb::idbtransaction::IDBTransaction;
+ use crate::dom::indexeddb::key::key_type_to_jsval;
+@@ -45,6 +46,9 @@ use crate::realms::enter_auto_realm;
+ struct RequestListener {
+     request: Trusted<IDBRequest>,
+     iteration_param: Option<IterationParam>,
++    /// Set when this request is an index query, which the backend cannot answer
++    /// directly. See [`IDBIndex::records_for`].
++    index_param: Option<IndexQueryParam>,
+     request_id: u64,
+ }
+ 
+@@ -212,35 +216,66 @@ impl RequestListener {
+                     answer.handle_mut().set(DoubleValue(count as f64));
+                 },
+                 IdbResult::Iterate(records) => {
+-                    let param = self.iteration_param.as_ref().expect(
+-                        "iteration_param must be provided by IDBRequest::execute_async for Iterate",
+-                    );
+-                    let cursor = match iterate_cursor(&global, cx, param, records) {
+-                        Ok(cursor) => cursor,
+-                        Err(e) => {
+-                            warn!("Error reading structuredclone data");
+-                            Self::handle_async_request_error(
+-                                &global,
+-                                cx,
+-                                request,
+-                                e,
+-                                self.request_id,
+-                            );
+-                            return;
++                    // An index query arrives here as a full scan of the owning
++                    // object store, because the backend keeps no index entries.
++                    // Derive this index's records first; see IDBIndex::records_for.
++                    let mut answered_directly = false;
++                    let records = match self.index_param.as_ref() {
++                        Some(index_param) => {
++                            let index = index_param.index.root();
++                            let mut records = index.records_for(cx, &global, records);
++                            records.retain(|record| index_param.range.contains(&record.key));
++                            if index_param.kind != IndexQueryKind::Cursor {
++                                if let Err(e) =
++                                    index_param.answer(cx, &global, &records, answer.handle_mut())
++                                {
++                                    Self::handle_async_request_error(
++                                        &global,
++                                        cx,
++                                        request,
++                                        e,
++                                        self.request_id,
++                                    );
++                                    return;
++                                }
++                                answered_directly = true;
++                            }
++                            records
+                         },
++                        None => records,
+                     };
+-                    if let Some(cursor) = cursor {
+-                        match cursor.downcast::<IDBCursorWithValue>() {
+-                            Some(cursor_with_value) => {
+-                                answer.handle_mut().set(ObjectValue(
+-                                    *cursor_with_value.reflector().get_jsobject(),
+-                                ));
+-                            },
+-                            None => {
+-                                answer
+-                                    .handle_mut()
+-                                    .set(ObjectValue(*cursor.reflector().get_jsobject()));
++
++                    if !answered_directly {
++                        let param = self.iteration_param.as_ref().expect(
++                            "iteration_param must be provided by IDBRequest::execute_async for Iterate",
++                        );
++                        let cursor = match iterate_cursor(&global, cx, param, records) {
++                            Ok(cursor) => cursor,
++                            Err(e) => {
++                                warn!("Error reading structuredclone data");
++                                Self::handle_async_request_error(
++                                    &global,
++                                    cx,
++                                    request,
++                                    e,
++                                    self.request_id,
++                                );
++                                return;
+                             },
++                        };
++                        if let Some(cursor) = cursor {
++                            match cursor.downcast::<IDBCursorWithValue>() {
++                                Some(cursor_with_value) => {
++                                    answer.handle_mut().set(ObjectValue(
++                                        *cursor_with_value.reflector().get_jsobject(),
++                                    ));
++                                },
++                                None => {
++                                    answer
++                                        .handle_mut()
++                                        .set(ObjectValue(*cursor.reflector().get_jsobject()));
++                                },
++                            }
+                         }
+                     }
+                 },
+@@ -470,6 +505,23 @@ impl IDBRequest {
+         request: Option<DomRoot<IDBRequest>>,
+         iteration_param: Option<IterationParam>,
+     ) -> Fallible<DomRoot<IDBRequest>>
++    where
++        T: Into<IdbResult> + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
++        F: FnOnce(GenericCallback<BackendResult<T>>) -> AsyncOperation,
++    {
++        Self::execute_async_indexed(cx, source, operation_fn, request, iteration_param, None)
++    }
++
++    /// As [`execute_async`](Self::execute_async), for a request whose reply has to
++    /// be reinterpreted through an index before script sees it.
++    pub fn execute_async_indexed<T, F>(
++        cx: &mut JSContext,
++        source: &IDBObjectStore,
++        operation_fn: F,
++        request: Option<DomRoot<IDBRequest>>,
++        iteration_param: Option<IterationParam>,
++        index_param: Option<IndexQueryParam>,
++    ) -> Fallible<DomRoot<IDBRequest>>
+     where
+         T: Into<IdbResult> + for<'a> Deserialize<'a> + Serialize + Send + Sync + 'static,
+         F: FnOnce(GenericCallback<BackendResult<T>>) -> AsyncOperation,
+@@ -506,6 +558,7 @@ impl IDBRequest {
+         let response_listener = RequestListener {
+             request: Trusted::new(&request),
+             iteration_param: iteration_param.clone(),
++            index_param: index_param.clone(),
+             request_id,
+         };
+ 
+@@ -531,13 +584,15 @@ impl IDBRequest {
+             .expect("Could not create callback");
+         let operation = operation_fn(callback);
+ 
++        // An Iterate is either a cursor step, which needs an iteration_param, or an
++        // index query, which scans the store and interprets the records itself.
+         if matches!(
+             operation,
+             AsyncOperation::ReadOnly(AsyncReadOnlyOperation::Iterate { .. })
+         ) {
+             assert!(
+-                iteration_param.is_some(),
+-                "iteration_param must be provided for Iterate"
++                iteration_param.is_some() || index_param.is_some(),
++                "an Iterate needs either an iteration_param or an index_param"
+             );
+         } else {
+             assert!(
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 6e57bf3d5..017dc9751 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -867,7 +867,7 @@ DOMInterfaces = {
+ },
+ 
+ 'IDBIndex': {
+-    'cx': ['KeyPath'],
++    'cx': ['KeyPath', 'Get', 'GetKey', 'GetAll', 'GetAllKeys', 'Count', 'OpenCursor', 'OpenKeyCursor'],
+ },
+ 
+ 'IDBKeyRange': {
+diff --git a/components/script_bindings/webidls/IDBIndex.webidl b/components/script_bindings/webidls/IDBIndex.webidl
+index 8985569d8..5ca5aabd7 100644
+--- a/components/script_bindings/webidls/IDBIndex.webidl
++++ b/components/script_bindings/webidls/IDBIndex.webidl
+@@ -15,17 +15,17 @@ interface IDBIndex {
+   readonly attribute boolean multiEntry;
+   readonly attribute boolean unique;
+ 
+-  // [NewObject] IDBRequest get(any query);
+-  // [NewObject] IDBRequest getKey(any query);
+-  // [NewObject] IDBRequest getAll(optional any queryOrOptions,
+-  //                               optional [EnforceRange] unsigned long count);
+-  // [NewObject] IDBRequest getAllKeys(optional any queryOrOptions,
+-  //                                   optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest get(any query);
++  [NewObject, Throws] IDBRequest getKey(any query);
++  [NewObject, Throws] IDBRequest getAll(optional any query,
++                                        optional [EnforceRange] unsigned long count);
++  [NewObject, Throws] IDBRequest getAllKeys(optional any query,
++                                            optional [EnforceRange] unsigned long count);
+   // [NewObject] IDBRequest getAllRecords(optional IDBGetAllOptions options = {});
+-  // [NewObject] IDBRequest count(optional any query);
++  [NewObject, Throws] IDBRequest count(optional any query);
+ 
+-  // [NewObject] IDBRequest openCursor(optional any query,
+-  //                                   optional IDBCursorDirection direction = "next");
+-  // [NewObject] IDBRequest openKeyCursor(optional any query,
+-  //                                      optional IDBCursorDirection direction = "next");
++  [NewObject, Throws] IDBRequest openCursor(optional any query,
++                                            optional IDBCursorDirection direction = "next");
++  [NewObject, Throws] IDBRequest openKeyCursor(optional any query,
++                                               optional IDBCursorDirection direction = "next");
+ };
+-- 
+2.52.0.windows.1
+
