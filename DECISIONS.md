@@ -107,6 +107,32 @@ page with a live QR, presenting as Firefox 143, one process, 442 MB working set 
 should read Firefox, not Edge. The cost he accepted in #10 stands: about 440 to 465 MB against
 375 MB for the OS webview.
 
+**13. Servo is retired as the engine (2026-09-07).** His words: "Servo has been, like, shitty."
+It works: our fork logs in, renders the real chat list, and shows as Firefox on his phone, which was
+the whole point of #12. It is also the slowest and heaviest option we have: about 30 frames per
+second with 300 ms stalls, ~1.2 GB on a synced account against 803 MB for the Chrome wrapper it was
+meant to replace, and no voice or video calls ever, because Servo has no WebRTC. Five engine patches
+were needed before WhatsApp would load at all. Consequence: stop building on Servo. The fork, the
+nine upstreamable patches and every measurement stay in the tree; nothing is deleted unless he asks.
+
+**14. Light mode is retired (2026-09-07).** His words: "we'll ditch the WhatsApp, like, Rust bannable
+engine as well, 'cause I don't really care about that." This is the native-protocol client from #8's
+era: ~20 MB, and a permanent ban risk (see the ban rule at the top of HANDOFF.md). He was never going
+to run it on his own number and would not get a spare one, so it existed only for other people.
+Consequence: the code and its WhatsApp-styled window stay, unmaintained; the first-run picker that
+chose between safe and light mode loses its reason to exist.
+
+**15. The new direction: bundle an engine, and compare two (2026-09-07).** Build safe mode twice,
+once on Chromium and once on Firefox, both trimmed down, and measure them head to head on memory and
+responsiveness before choosing. He is not contradicting his dislike of those browsers: the objection
+was ever having to run *someone else's installed browser*, or being labelled Microsoft Edge on his
+phone. A bundled engine we control is a different thing. The asymmetry to design around, recorded so
+it is not rediscovered: Chromium can be genuinely embedded (the `cef` crate, 152.0.0, published
+2026-09-07), so we keep our own window, tray and close-to-tray; Firefox cannot be embedded at all
+since Mozilla ended its embedding project, so a Firefox build means driving a separate process and
+inheriting every problem the C# original's ChromeFinder, WindowFinder and Hooks classes existed to
+solve.
+
 ## Standing consequence of 1 + 2 + 3
 
 The honest tension to keep visible: there is no embeddable engine in 2026 that renders

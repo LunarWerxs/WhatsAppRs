@@ -1,5 +1,12 @@
 # WhatsApp desktop app: handoff
 
+> **STOP. Direction changed 2026-09-07.** Servo and light mode are both retired
+> (DECISIONS.md #13, #14). The next task is two new builds, one on bundled Chromium and one on
+> Firefox, measured head to head. **Start from `NEXT_PROMPT.md`, not from this file.** Everything
+> below is still accurate history and measurement, and is worth reading, but it describes a
+> direction that has been abandoned.
+
+
 Paste this whole file to the next AI. Everything below was built and measured on this
 machine (Windows 11, 32 cores). Numbers are measured, never estimated.
 
