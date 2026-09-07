@@ -296,7 +296,68 @@ Noise in the log that is not a fault: "Empty hit test result" and "Unknown pipel
 mouse moves over the window before the page exists; one WebSocket `ResetWithoutClosingHandshake`,
 which is WhatsApp's QR socket cycling.
 
-## Light mode's chat window, measured 2026-09-07
+## Why Servo logged in and then stalled on "Loading your chats", 2026-09-07
+
+Michael scanned the QR, his phone listed the device as **Firefox**, and the page then sat on
+"Loading your chats" and never advanced. Login had worked and IndexedDB was filling, so the socket
+and the main thread were both fine. The cause was on the other side of a worker.
+
+**The embedder was deaf.** `WebViewDelegate::show_console_message` was never implemented, so every
+error the page logged went nowhere. That is why the stall looked silent. Implementing it, plus a
+probe that asks the page what it has (`WHATSAPP_RS_PROBE`), turned this from guesswork into
+measurement, and everything below came from it.
+
+**Servo keeps most web APIs behind preferences that default to off**, and safe mode was setting only
+three. Measured on the login page, all of these were undefined: `IntersectionObserver`,
+`navigator.storage`, `navigator.permissions`, `OffscreenCanvas`, `FontFace`, `Element.animate`,
+`CompositionEvent`, `visualViewport`. A virtualised chat list cannot render without the first.
+Twelve prefs are now set by name in `servo_view.rs`.
+
+**Three APIs were absent entirely, not just switched off**: `requestIdleCallback`, `navigator.locks`
+(Web Locks) and `navigator.storage.getDirectory` (OPFS).
+
+**The Web Locks one is what hung the app.** WhatsApp's backend worker script calls
+`self.navigator.locks.request(name, {steal: true}, ...)` unguarded, and the statement that registers
+its message handler is the last line of the file. With no `navigator.locks` that call throws a
+synchronous TypeError, so the handler is never registered, the worker answers nothing, and the main
+thread's boot waits on it with no timeout and no error handler. Every other `navigator.locks` call
+in WhatsApp's 13 MB of bundles is null-guarded; the worker's is the only one that is not.
+
+Fixed by implementing Web Locks in the fork (commit `441e31675`): `LockManager` and `Lock`, exposed
+on Window **and WorkerNavigator**, with a process-global registry keyed by origin so a window and
+its workers see the same locks, and cross-thread waking so a lock released on one thread can be
+granted to a waiter on another. Verified in the generated bindings that `WorkerNavigator.Locks`
+exists, which is the global that matters.
+
+A page-side polyfill would not have been enough: **Servo's user scripts are injected into documents
+only, never into workers**, so an embedder cannot patch a worker global from outside. That is why
+the fix had to go into the engine. `requestIdleCallback` is window-only in every browser, so a page
+polyfill is sufficient there and that is what it gets.
+
+Still missing after all of this: **OPFS**. `StorageManager` in Servo has only `persisted`, `persist`
+and `estimate`; there is no `getDirectory` and no file-system-handle machinery behind it. It cannot
+be polyfilled cheaply.
+
+**The next blocker is already visible.** `IDBCursor.webidl` declares only readonly attributes: there
+is no `continue`, `advance`, `continuePrimaryKey`, `update` or `delete`. A page can open a cursor,
+read its first record, and never move past it. Bulk history reads use cursors, so this is the most
+likely next stop after the chat list appears.
+
+## Storage persistence on Servo, measured 2026-09-07
+
+Written in one run, read back in the next, with a clean shutdown between
+(`WHATSAPP_RS_QUIT_AFTER` runs the same path as the tray's Quit):
+
+| what | survived a clean restart |
+| --- | --- |
+| `localStorage` | yes |
+| IndexedDB record | yes |
+| WhatsApp's own HTTP cookies | yes, `cookie_jar.json` written at quit and read at start |
+| a cookie set from JavaScript | no, it never reaches the jar |
+
+The catch: Servo writes the cookie jar **only at shutdown**. Killing the process skips it and costs
+the login. That is how a logged-in session was lost during this session's debugging, and it means
+"quit from the tray" is currently load-bearing rather than a nicety.
 
 Instrument: `tools/light-drive.ps1`. Plain Win32 controls (list box, two edit boxes, a button) and
 GDI for the QR; no toolkit, no GPU.

@@ -205,7 +205,24 @@ Verified 2026-09-07 (session two), all by running it, instruments in `tools/`:
    that found both silent failures.
    A leftover: `target/release/whatsapp.running.exe` is his running instance's binary,
    renamed out of the way so a build could write; delete it once he has quit that instance.
-4. Optional: submit the four Servo commits upstream. They are exported as patch files in
+3c. **The chat-load stall, diagnosed and fixed 2026-09-07 (unverified against a real login).**
+   Michael logged in on the Servo build, his phone showed **Firefox**, and the page then stuck on
+   "Loading your chats". Root cause: WhatsApp's backend worker calls `navigator.locks.request()`
+   unguarded on its first line, Servo had no Web Locks, so the worker threw before registering its
+   message handler and the page waited on it forever. Web Locks is now implemented in the fork
+   (`441e31675`, exported as `servo-patches/0005-*`), exposed on Window and **WorkerNavigator**.
+   Twelve engine prefs that WhatsApp needs are now set by name, page-side polyfills cover
+   `requestIdleCallback`, and the page's console is finally forwarded to stderr.
+   **What is NOT verified: that the chat list now loads.** That needs Michael to scan the QR again.
+   The app is running on his real profile with `WHATSAPP_RS_PROBE=1`, and its log
+   (`scratchpad/session.err`) will capture the next login attempt.
+   **The next blocker is already known:** `IDBCursor` in Servo has no `continue`/`advance`, so a
+   cursor cannot iterate, and bulk history reads use cursors. Expect that to bite next; it is
+   another fork patch, similar in size to the Cache Storage one.
+   Also still missing and not cheaply fixable: **OPFS** (`navigator.storage.getDirectory`).
+   ⚠ Servo writes the cookie jar **only on a clean shutdown**. Killing the process loses the login.
+   Quit from the tray. (This is how a logged-in session was lost while debugging today.)
+4. Optional: submit the five Servo commits upstream. They are exported as patch files in
    `servo-patches/` with a ready-to-paste PR description. Needs his GitHub account.
 5. Nothing is committed: the repo has no commits yet (`git log` is empty). Nothing has been
    pushed anywhere. Commit when he says to.

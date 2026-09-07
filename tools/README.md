@@ -17,7 +17,30 @@ Python 3 with `websocket-client` on PATH. Run from anywhere; paths are script-re
 | `safe-drive.ps1 [-Exe path] [-Wait 25]` | Launches safe mode on a scratch profile and its own instance lock (so a real logged-in instance is untouched), screenshots the window, prints the process tree's memory, kills it. Works for either engine build. |
 | `light-drive.ps1 -Mode demo\|pair [-Theme light\|dark]` | Light mode's window. `demo` opens it with sample chats and no network, moves it clear of overlays, clicks the first chat with a real mouse click (after printing what is under the cursor), types into the send box, presses Enter, screenshots before and after, and prints memory. `pair` opens the real thing as far as the QR (never scanned), screenshots it, and kills it. `-Theme` forces a palette through `WHATSAPP_RS_THEME`. |
 
-Two things learned building these, so nobody rebuilds the wrong instrument:
+## Environment switches the Servo build understands
+
+Set these before launching `target/servo/whatsapp.exe`. They exist so a suspect can be tested
+without a rebuild, which matters when a rebuild compiles a browser engine.
+
+| variable | what it does |
+| --- | --- |
+| `WHATSAPP_RS_PROBE=1` | Every 1.5 s, ask the page which web APIs it has, what text is on screen, and what errors it caught; print it to stderr. This is how the chat-load stall was diagnosed. |
+| `WHATSAPP_RS_PREFS="name=value,..."` | Override any Servo preference at startup, e.g. `dom_serviceworker_enabled=false`. No rebuild. |
+| `WHATSAPP_RS_EVAL="<js>"` | Run one expression once the page loads and print the result. |
+| `WHATSAPP_RS_QUIT_AFTER=<seconds>` | Shut down cleanly, the same path as the tray's Quit. Use this for persistence tests: killing the process skips the cookie flush and loses the login. |
+| `WHATSAPP_RS_DATA_DIR=<path>` | Use a scratch profile, so a test instance never touches a real logged-in one. |
+| `WHATSAPP_RS_INSTANCE_PORT=<port>` | Take a different single-instance lock, so a test instance can run beside a real one. |
+| `RUST_LOG=warn,whatsapp_rs=info` | Engine log detail. The app's own lines are tagged `[whatsapp-rs]`, `[console …]`, `[probe …]` and `[eval]`. |
+
+Things learned building these, so nobody rebuilds the wrong instrument:
+
+- **The page's console is the whole game.** Until `show_console_message` was implemented in the
+  embedder, every error WhatsApp logged was discarded and a hung boot looked silent.
+- **Blob-URL workers do not run in Servo.** A test that creates a worker from
+  `URL.createObjectURL(new Blob([...]))` fails with an empty error event, which looks exactly like
+  the bug you are chasing. Verify worker-global APIs in the generated bindings instead.
+- **User scripts never reach workers.** An embedder cannot polyfill a worker global from outside;
+  that work has to go into the engine.
 
 - Watching for a toast window through UI Automation does not work on this Windows build (26200):
   no `ShellExperienceHost` window ever appears; the shell lives in `ShellHost.exe`. Screenshot the

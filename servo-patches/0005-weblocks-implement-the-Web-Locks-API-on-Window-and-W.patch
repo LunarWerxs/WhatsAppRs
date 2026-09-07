@@ -1,0 +1,1041 @@
+From 441e316756fe9fd597a8c20365ec4fe0bc4786b0 Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 13:03:21 -0500
+Subject: [PATCH] weblocks: implement the Web Locks API on Window and
+ WorkerNavigator
+
+Servo had no navigator.locks. That is not merely a missing convenience: a page
+that calls navigator.locks.request() without a guard gets a TypeError, and when
+that happens on the first line of a worker script the worker dies before it can
+register its message handler, so it never answers the page and the page waits
+forever. web.whatsapp.com does exactly this in its backend worker, which is why
+it logs in and then sits on "Loading your chats" forever.
+
+- WebLocks.webidl: LockManager (request with both spec overloads, and query) and
+  Lock, behind a new dom_weblocks_enabled pref, exposed on Window and Worker.
+- registry.rs: the lock state, process-global and keyed by origin, because a
+  window and its workers share an origin and must see the same locks. Waiters
+  park a Send waker that queues a task back on their own event loop, so the
+  thread that releases a lock can grant it to a waiter on another thread.
+  Unit tests cover exclusion, sharing, ifAvailable and steal.
+- lockmanager.rs: a granted lock lives exactly as long as the promise its
+  callback returned, which is the whole release mechanism; a native handler on
+  that promise releases the lock and settles the outer one the same way.
+
+Known deviation: steal drops the previous holder without rejecting its promise
+with AbortError, and the AbortSignal option is accepted but not yet honoured.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ components/config/prefs.rs                    |   3 +
+ components/script/dom/mod.rs                  |   2 +
+ components/script/dom/navigator/navigator.rs  |   9 +
+ components/script/dom/weblocks/lock.rs        |  55 +++
+ components/script/dom/weblocks/lockmanager.rs | 330 ++++++++++++++++
+ components/script/dom/weblocks/mod.rs         |   7 +
+ components/script/dom/weblocks/registry.rs    | 353 ++++++++++++++++++
+ .../script/dom/workers/workernavigator.rs     |   9 +
+ .../script_bindings/codegen/Bindings.conf     |   9 +-
+ .../script_bindings/webidls/Navigator.webidl  |   5 +
+ .../script_bindings/webidls/WebLocks.webidl   |  43 +++
+ .../webidls/WorkerNavigator.webidl            |   6 +
+ 12 files changed, 829 insertions(+), 2 deletions(-)
+ create mode 100644 components/script/dom/weblocks/lock.rs
+ create mode 100644 components/script/dom/weblocks/lockmanager.rs
+ create mode 100644 components/script/dom/weblocks/mod.rs
+ create mode 100644 components/script/dom/weblocks/registry.rs
+ create mode 100644 components/script_bindings/webidls/WebLocks.webidl
+
+diff --git a/components/config/prefs.rs b/components/config/prefs.rs
+index 9d616f8cf..7e1455c6b 100644
+--- a/components/config/prefs.rs
++++ b/components/config/prefs.rs
+@@ -227,6 +227,8 @@ pub struct Preferences {
+     // feature: WebGL2 | #41394 | Web/API/WebGL2RenderingContext
+     pub dom_webgl2_enabled: bool,
+     // feature: WebRTC | #41396 | Web/API/WebRTC_API
++    /// Enable the Web Locks API (`navigator.locks`).
++    pub dom_weblocks_enabled: bool,
+     pub dom_webrtc_enabled: bool,
+     // feature: WebRTC Transceiver | #41396 | Web/API/RTCRtpTransceiver
+     pub dom_webrtc_transceiver_enabled: bool,
+@@ -491,6 +493,7 @@ impl Preferences {
+             dom_webgl2_enabled: false,
+             dom_webgpu_enabled: false,
+             dom_webgpu_wgpu_backend: String::new(),
++            dom_weblocks_enabled: false,
+             dom_webrtc_enabled: false,
+             dom_webrtc_transceiver_enabled: false,
+             dom_webxr_enabled: true,
+diff --git a/components/script/dom/mod.rs b/components/script/dom/mod.rs
+index d3ea8963b..ed7c911bd 100644
+--- a/components/script/dom/mod.rs
++++ b/components/script/dom/mod.rs
+@@ -359,6 +359,8 @@ pub(crate) mod webvtt;
+ pub(crate) use self::webvtt::*;
+ pub(crate) mod window;
+ pub(crate) use self::window::*;
++pub(crate) mod weblocks;
++pub(crate) use self::weblocks::*;
+ pub(crate) mod workers;
+ pub(crate) use self::workers::*;
+ pub(crate) mod worklet;
+diff --git a/components/script/dom/navigator/navigator.rs b/components/script/dom/navigator/navigator.rs
+index 17c61cd96..020ba2434 100644
+--- a/components/script/dom/navigator/navigator.rs
++++ b/components/script/dom/navigator/navigator.rs
+@@ -55,6 +55,7 @@ use crate::dom::mimetypearray::MimeTypeArray;
+ use crate::dom::navigatorinfo;
+ use crate::dom::performance::performanceresourcetiming::InitiatorType;
+ use crate::dom::permissions::Permissions;
++use crate::dom::weblocks::lockmanager::LockManager;
+ use crate::dom::pluginarray::PluginArray;
+ use crate::dom::serviceworkercontainer::ServiceWorkerContainer;
+ use crate::dom::servointernals::ServoInternals;
+@@ -130,6 +131,7 @@ pub(crate) struct Navigator {
+     #[cfg(feature = "gamepad")]
+     gamepads: DomRefCell<Vec<MutNullableDom<Gamepad>>>,
+     permissions: MutNullableDom<Permissions>,
++    locks: MutNullableDom<LockManager>,
+     mediasession: MutNullableDom<MediaSession>,
+     clipboard: MutNullableDom<Clipboard>,
+     storage: MutNullableDom<StorageManager>,
+@@ -159,6 +161,7 @@ impl Navigator {
+             #[cfg(feature = "gamepad")]
+             gamepads: Default::default(),
+             permissions: Default::default(),
++            locks: Default::default(),
+             mediasession: Default::default(),
+             clipboard: Default::default(),
+             storage: Default::default(),
+@@ -472,6 +475,12 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
+             .or_init(|| Permissions::new(cx, &self.global()))
+     }
+ 
++    /// <https://w3c.github.io/web-locks/#navigator-mixins>
++    fn Locks(&self, cx: &mut JSContext) -> DomRoot<LockManager> {
++        self.locks
++            .or_init(|| LockManager::new(cx, &self.global()))
++    }
++
+     /// <https://immersive-web.github.io/webxr/#dom-navigator-xr>
+     #[cfg(feature = "webxr")]
+     fn Xr(&self, cx: &mut JSContext) -> DomRoot<XRSystem> {
+diff --git a/components/script/dom/weblocks/lock.rs b/components/script/dom/weblocks/lock.rs
+new file mode 100644
+index 000000000..78c4f4272
+--- /dev/null
++++ b/components/script/dom/weblocks/lock.rs
+@@ -0,0 +1,55 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
++use script_bindings::root::DomRoot;
++
++use crate::dom::bindings::codegen::Bindings::WebLocksBinding::{LockMethods, LockMode};
++use crate::dom::bindings::str::DOMString;
++use crate::dom::globalscope::GlobalScope;
++
++/// <https://w3c.github.io/web-locks/#api-lock>
++///
++/// Handed to the callback of a granted [`LockManager::request`]. It is a receipt,
++/// not a handle: the lock is released when the callback's promise settles, so
++/// there is nothing to call on it.
++#[dom_struct]
++pub(crate) struct Lock {
++    reflector_: Reflector,
++    name: DOMString,
++    mode: LockMode,
++}
++
++impl Lock {
++    fn new_inherited(name: DOMString, mode: LockMode) -> Lock {
++        Lock {
++            reflector_: Reflector::new(),
++            name,
++            mode,
++        }
++    }
++
++    pub(crate) fn new(
++        cx: &mut JSContext,
++        global: &GlobalScope,
++        name: DOMString,
++        mode: LockMode,
++    ) -> DomRoot<Lock> {
++        reflect_dom_object_with_cx(Box::new(Lock::new_inherited(name, mode)), global, cx)
++    }
++}
++
++impl LockMethods<crate::DomTypeHolder> for Lock {
++    /// <https://w3c.github.io/web-locks/#dom-lock-name>
++    fn Name(&self) -> DOMString {
++        self.name.clone()
++    }
++
++    /// <https://w3c.github.io/web-locks/#dom-lock-mode>
++    fn Mode(&self) -> LockMode {
++        self.mode
++    }
++}
+diff --git a/components/script/dom/weblocks/lockmanager.rs b/components/script/dom/weblocks/lockmanager.rs
+new file mode 100644
+index 000000000..f22619946
+--- /dev/null
++++ b/components/script/dom/weblocks/lockmanager.rs
+@@ -0,0 +1,330 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++use std::cell::RefCell;
++use std::collections::HashMap;
++use std::rc::Rc;
++
++use dom_struct::dom_struct;
++use js::context::JSContext;
++use js::gc::HandleValue;
++use js::realm::CurrentRealm;
++use script_bindings::callback::{ExceptionHandling, RootedCallback, TracedCallback};
++use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
++use script_bindings::root::DomRoot;
++
++use crate::dom::Promise;
++use crate::dom::bindings::codegen::Bindings::WebLocksBinding::{
++    LockGrantedCallback, LockInfo, LockManagerMethods, LockManagerSnapshot, LockMode, LockOptions,
++};
++use crate::dom::bindings::error::Error;
++use crate::dom::bindings::refcounted::Trusted;
++use crate::dom::bindings::reflector::DomGlobal;
++use crate::dom::bindings::str::DOMString;
++use crate::dom::globalscope::GlobalScope;
++use crate::dom::promise::promisenativehandler::{Callback, PromiseNativeHandler};
++use crate::dom::weblocks::lock::Lock;
++use crate::dom::weblocks::registry;
++use crate::realms::enter_auto_realm;
++
++/// A request that is waiting its turn. Held here, on the DOM object, so the
++/// promise and the page's callback stay traced while the lock is contended.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++struct PendingRequest {
++    #[conditional_malloc_size_of]
++    promise: Rc<Promise>,
++    callback: TracedCallback<LockGrantedCallback>,
++    name: DOMString,
++    mode: LockMode,
++}
++
++/// <https://w3c.github.io/web-locks/#api-lock-manager>
++///
++/// One per global. The locks themselves are process-wide and live in
++/// [`registry`], because a window and its workers share an origin and must see
++/// the same locks.
++#[dom_struct]
++pub(crate) struct LockManager {
++    reflector_: Reflector,
++    /// Names this context in the results of [`query`](LockManagerMethods::Query).
++    client_id: DOMString,
++    /// Queued requests belonging to this global, by registry id.
++    #[ignore_malloc_size_of = "small bookkeeping map"]
++    pending: RefCell<HashMap<u64, PendingRequest>>,
++}
++
++impl LockManager {
++    fn new_inherited(client_id: DOMString) -> LockManager {
++        LockManager {
++            reflector_: Reflector::new(),
++            client_id,
++            pending: RefCell::new(HashMap::new()),
++        }
++    }
++
++    pub(crate) fn new(cx: &mut JSContext, global: &GlobalScope) -> DomRoot<LockManager> {
++        // Enough to tell two contexts of one origin apart, which is all a client id
++        // is used for here.
++        let client_id = DOMString::from(format!("client-{}", registry::next_id()));
++        reflect_dom_object_with_cx(Box::new(LockManager::new_inherited(client_id)), global, cx)
++    }
++
++    fn origin(&self) -> String {
++        self.global().origin().immutable().ascii_serialization().to_string()
++    }
++
++    fn key(&self, name: &DOMString) -> registry::Key {
++        (self.origin(), name.to_string())
++    }
++
++    /// The shared body of both `request` overloads.
++    fn request_lock(
++        &self,
++        cx: &mut JSContext,
++        name: DOMString,
++        options: &LockOptions,
++        callback: RootedCallback<LockGrantedCallback>,
++    ) -> Rc<Promise> {
++        let global = self.global();
++        let promise = Promise::new(cx, &global);
++
++        // <https://w3c.github.io/web-locks/#request-method> steps 3 to 6.
++        if name.starts_with('-') {
++            promise.reject_error(
++                cx,
++                Error::NotSupported(Some("a lock name may not start with '-'".into())),
++            );
++            return promise;
++        }
++        if options.steal && options.mode == LockMode::Shared {
++            promise.reject_error(
++                cx,
++                Error::NotSupported(Some("steal requires the exclusive mode".into())),
++            );
++            return promise;
++        }
++        if options.steal && options.ifAvailable {
++            promise.reject_error(
++                cx,
++                Error::NotSupported(Some("steal and ifAvailable are mutually exclusive".into())),
++            );
++            return promise;
++        }
++
++        let id = registry::next_id();
++        let mode = options.mode;
++        let waker = {
++            let this = Trusted::new(self);
++            let task_source = global
++                .task_manager()
++                .dom_manipulation_task_source()
++                .to_sendable();
++            Box::new(move || {
++                let this = this.clone();
++                task_source.queue(task!(weblocks_lock_granted: move |cx| {
++                    this.root().deliver_pending(cx, id);
++                }));
++            })
++        };
++
++        let outcome = registry::request(
++            self.key(&name),
++            id,
++            to_registry_mode(mode),
++            self.client_id.to_string(),
++            options.steal,
++            options.ifAvailable,
++            waker,
++        );
++
++        match outcome {
++            registry::Outcome::Granted => {
++                self.deliver(cx, id, &name, mode, &callback, &promise, true);
++            },
++            // <https://w3c.github.io/web-locks/#dom-lockoptions-ifavailable>: the
++            // callback still runs, with null in place of a lock.
++            registry::Outcome::Unavailable => {
++                self.deliver(cx, id, &name, mode, &callback, &promise, false);
++            },
++            registry::Outcome::Queued => {
++                self.pending.borrow_mut().insert(
++                    id,
++                    PendingRequest {
++                        promise: promise.clone(),
++                        callback: callback.to_traced(),
++                        name,
++                        mode,
++                    },
++                );
++            },
++        }
++        promise
++    }
++
++    /// A queued request whose turn has come, woken by whoever released the lock.
++    fn deliver_pending(&self, cx: &mut JSContext, id: u64) {
++        let Some(pending) = self.pending.borrow_mut().remove(&id) else {
++            return;
++        };
++        self.deliver(
++            cx,
++            id,
++            &pending.name,
++            pending.mode,
++            &pending.callback,
++            &pending.promise,
++            true,
++        );
++    }
++
++    /// Run the page's callback and tie the lock's lifetime to the promise it
++    /// returns, which is what makes a lock release itself.
++    fn deliver(
++        &self,
++        cx: &mut JSContext,
++        id: u64,
++        name: &DOMString,
++        mode: LockMode,
++        callback: &LockGrantedCallback,
++        promise: &Rc<Promise>,
++        holds_lock: bool,
++    ) {
++        let global = self.global();
++        let lock = holds_lock.then(|| Lock::new(cx, &global, name.clone(), mode));
++
++        let result = callback.Call__(cx, lock.as_deref(), ExceptionHandling::Rethrow);
++
++        let inner = match result {
++            Ok(inner) => inner,
++            Err(error) => {
++                // The callback threw, so the lock is not held by anything now.
++                if holds_lock {
++                    registry::release(&self.key(name), id);
++                }
++                promise.reject_error(cx, error);
++                return;
++            },
++        };
++
++        let release = ReleaseTarget {
++            origin: self.origin(),
++            name: name.to_string(),
++            id,
++            active: holds_lock,
++        };
++        let handler = PromiseNativeHandler::new(
++            cx,
++            &global,
++            Some(Box::new(SettleLock {
++                promise: promise.clone(),
++                release: release.clone(),
++                rejected: false,
++            }) as Box<dyn Callback>),
++            Some(Box::new(SettleLock {
++                promise: promise.clone(),
++                release,
++                rejected: true,
++            }) as Box<dyn Callback>),
++        );
++        let mut realm = enter_auto_realm(cx, &*global);
++        inner.append_native_handler(&mut realm.current_realm(), &handler);
++    }
++}
++
++/// Which lock to let go of once the callback's promise settles.
++#[derive(Clone, JSTraceable, MallocSizeOf)]
++struct ReleaseTarget {
++    origin: String,
++    name: String,
++    id: u64,
++    /// False for an `ifAvailable` request that never got the lock.
++    active: bool,
++}
++
++impl ReleaseTarget {
++    fn release(&self) {
++        if self.active {
++            registry::release(&(self.origin.clone(), self.name.clone()), self.id);
++        }
++    }
++}
++
++/// Releases the lock, then settles the outer promise the same way the callback's
++/// promise settled. This is the whole release mechanism: a Web Lock is held for
++/// exactly as long as the promise its callback returned.
++#[derive(JSTraceable, MallocSizeOf)]
++#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
++struct SettleLock {
++    #[conditional_malloc_size_of]
++    promise: Rc<Promise>,
++    release: ReleaseTarget,
++    rejected: bool,
++}
++
++impl Callback for SettleLock {
++    fn callback(&self, cx: &mut CurrentRealm, value: HandleValue) {
++        self.release.release();
++        if self.rejected {
++            self.promise.reject(cx, value);
++        } else {
++            self.promise.resolve(cx, value);
++        }
++    }
++}
++
++fn to_registry_mode(mode: LockMode) -> registry::Mode {
++    match mode {
++        LockMode::Shared => registry::Mode::Shared,
++        LockMode::Exclusive => registry::Mode::Exclusive,
++    }
++}
++
++fn to_dom_mode(mode: registry::Mode) -> LockMode {
++    match mode {
++        registry::Mode::Shared => LockMode::Shared,
++        registry::Mode::Exclusive => LockMode::Exclusive,
++    }
++}
++
++impl LockManagerMethods<crate::DomTypeHolder> for LockManager {
++    /// <https://w3c.github.io/web-locks/#dom-lockmanager-request>
++    fn Request(
++        &self,
++        cx: &mut JSContext,
++        name: DOMString,
++        callback: RootedCallback<LockGrantedCallback>,
++    ) -> Rc<Promise> {
++        self.request_lock(cx, name, &LockOptions::empty(), callback)
++    }
++
++    /// <https://w3c.github.io/web-locks/#dom-lockmanager-request>
++    fn Request_(
++        &self,
++        cx: &mut JSContext,
++        name: DOMString,
++        options: &LockOptions,
++        callback: RootedCallback<LockGrantedCallback>,
++    ) -> Rc<Promise> {
++        self.request_lock(cx, name, options, callback)
++    }
++
++    /// <https://w3c.github.io/web-locks/#dom-lockmanager-query>
++    fn Query(&self, cx: &mut JSContext) -> Rc<Promise> {
++        let global = self.global();
++        let promise = Promise::new(cx, &global);
++        let (held, pending) = registry::snapshot(&self.origin());
++        let to_info = |info: registry::Info| LockInfo {
++            name: Some(DOMString::from(info.name)),
++            mode: Some(to_dom_mode(info.mode)),
++            clientId: Some(DOMString::from(info.client_id)),
++        };
++        let snapshot = LockManagerSnapshot {
++            held: Some(held.into_iter().map(to_info).collect()),
++            pending: Some(pending.into_iter().map(to_info).collect()),
++        };
++        promise.resolve_native(cx, &snapshot);
++        promise
++    }
++}
+diff --git a/components/script/dom/weblocks/mod.rs b/components/script/dom/weblocks/mod.rs
+new file mode 100644
+index 000000000..bef994eaa
+--- /dev/null
++++ b/components/script/dom/weblocks/mod.rs
+@@ -0,0 +1,7 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++pub(crate) mod lock;
++pub(crate) mod lockmanager;
++pub(crate) mod registry;
+diff --git a/components/script/dom/weblocks/registry.rs b/components/script/dom/weblocks/registry.rs
+new file mode 100644
+index 000000000..a61ac1e51
+--- /dev/null
++++ b/components/script/dom/weblocks/registry.rs
+@@ -0,0 +1,353 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++//! The lock bookkeeping behind [`LockManager`](super::lockmanager::LockManager).
++//!
++//! Web Locks are shared by every context of one origin, so this state cannot live
++//! on the DOM object: a window and its workers each get their own `LockManager`
++//! and must still see one another's locks. It is therefore process-global, keyed
++//! by origin, and guarded by a mutex because dedicated workers run on their own
++//! threads.
++//!
++//! A waiter cannot be woken directly, because the thread that releases a lock is
++//! usually not the thread that wanted it. Each waiter therefore parks a `waker`
++//! here, a small `Send` closure that queues a task back on its own event loop; the
++//! releasing thread runs it. Nothing that is not `Send` is stored.
++
++use std::collections::{HashMap, VecDeque};
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{LazyLock, Mutex};
++
++/// Which contexts a lock excludes.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub(crate) enum Mode {
++    Shared,
++    Exclusive,
++}
++
++/// Origin plus lock name. Two origins may hold the same name at once.
++pub(crate) type Key = (String, String);
++
++/// Queues a granted lock back onto the requesting thread's event loop.
++type Waker = Box<dyn FnOnce() + Send>;
++
++struct Holder {
++    id: u64,
++    mode: Mode,
++    client_id: String,
++}
++
++struct Waiter {
++    id: u64,
++    mode: Mode,
++    client_id: String,
++    waker: Waker,
++}
++
++#[derive(Default)]
++struct Entry {
++    held: Vec<Holder>,
++    waiting: VecDeque<Waiter>,
++}
++
++impl Entry {
++    /// A shared request joins other shared holders; an exclusive one needs the
++    /// lock empty. A queue that is already occupied blocks newcomers, so a waiting
++    /// exclusive request is not starved by a stream of shared ones.
++    fn can_grant(&self, mode: Mode) -> bool {
++        if !self.waiting.is_empty() {
++            return false;
++        }
++        match mode {
++            Mode::Exclusive => self.held.is_empty(),
++            Mode::Shared => self.held.iter().all(|h| h.mode == Mode::Shared),
++        }
++    }
++
++    fn is_empty(&self) -> bool {
++        self.held.is_empty() && self.waiting.is_empty()
++    }
++}
++
++static REGISTRY: LazyLock<Mutex<HashMap<Key, Entry>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++static NEXT_ID: AtomicU64 = AtomicU64::new(1);
++
++/// A process-wide identifier for one lock request.
++pub(crate) fn next_id() -> u64 {
++    NEXT_ID.fetch_add(1, Ordering::Relaxed)
++}
++
++/// What happened to a request. `Queued` means the waker will fire later.
++#[derive(Debug, PartialEq)]
++pub(crate) enum Outcome {
++    Granted,
++    /// `ifAvailable` was set and the lock was taken.
++    Unavailable,
++    Queued,
++}
++
++/// Ask for a lock. On `Outcome::Granted` the caller owns it until it calls
++/// [`release`] with the same `id`.
++pub(crate) fn request(
++    key: Key,
++    id: u64,
++    mode: Mode,
++    client_id: String,
++    steal: bool,
++    if_available: bool,
++    waker: Waker,
++) -> Outcome {
++    let mut registry = REGISTRY.lock().unwrap();
++    let entry = registry.entry(key).or_default();
++
++    // <https://w3c.github.io/web-locks/#dom-lockoptions-steal>: the existing
++    // holders lose the lock. Their promises are left to settle on their own rather
++    // than being rejected with AbortError, which is a deviation worth knowing
++    // about; nothing in the platform can force their callbacks to stop.
++    if steal {
++        entry.held.clear();
++    }
++
++    if steal || entry.can_grant(mode) {
++        entry.held.push(Holder {
++            id,
++            mode,
++            client_id,
++        });
++        return Outcome::Granted;
++    }
++
++    // Reaching here means something is holding or waiting, so the entry is not
++    // one this call just created and there is nothing to clean up.
++    if if_available {
++        return Outcome::Unavailable;
++    }
++
++    entry.waiting.push_back(Waiter {
++        id,
++        mode,
++        client_id,
++        waker,
++    });
++    Outcome::Queued
++}
++
++/// Give up a held lock, or abandon a queued request. Any waiters that this frees
++/// are granted here and their wakers run, outside the registry lock.
++pub(crate) fn release(key: &Key, id: u64) {
++    let mut woken: Vec<Waker> = Vec::new();
++    {
++        let mut registry = REGISTRY.lock().unwrap();
++        let Some(entry) = registry.get_mut(key) else {
++            return;
++        };
++        entry.held.retain(|h| h.id != id);
++        if let Some(index) = entry.waiting.iter().position(|w| w.id == id) {
++            entry.waiting.remove(index);
++        }
++
++        // Hand the lock to whoever is next in line, and to every shared request
++        // stacked behind them.
++        while let Some(next) = entry.waiting.front() {
++            let mode = next.mode;
++            let grantable = match mode {
++                Mode::Exclusive => entry.held.is_empty(),
++                Mode::Shared => entry.held.iter().all(|h| h.mode == Mode::Shared),
++            };
++            if !grantable {
++                break;
++            }
++            let waiter = entry.waiting.pop_front().expect("front() just succeeded");
++            entry.held.push(Holder {
++                id: waiter.id,
++                mode: waiter.mode,
++                client_id: waiter.client_id,
++            });
++            woken.push(waiter.waker);
++            if mode == Mode::Exclusive {
++                break;
++            }
++        }
++
++        if entry.is_empty() {
++            registry.remove(key);
++        }
++    }
++
++    for waker in woken {
++        waker();
++    }
++}
++
++/// One row of [`snapshot`].
++pub(crate) struct Info {
++    pub(crate) name: String,
++    pub(crate) mode: Mode,
++    pub(crate) client_id: String,
++}
++
++/// Every held and pending lock for one origin.
++/// <https://w3c.github.io/web-locks/#dom-lockmanager-query>
++pub(crate) fn snapshot(origin: &str) -> (Vec<Info>, Vec<Info>) {
++    let registry = REGISTRY.lock().unwrap();
++    let mut held = Vec::new();
++    let mut pending = Vec::new();
++    for ((entry_origin, name), entry) in registry.iter() {
++        if entry_origin != origin {
++            continue;
++        }
++        for holder in &entry.held {
++            held.push(Info {
++                name: name.clone(),
++                mode: holder.mode,
++                client_id: holder.client_id.clone(),
++            });
++        }
++        for waiter in &entry.waiting {
++            pending.push(Info {
++                name: name.clone(),
++                mode: waiter.mode,
++                client_id: waiter.client_id.clone(),
++            });
++        }
++    }
++    (held, pending)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn key(name: &str) -> Key {
++        ("https://example.com".into(), name.into())
++    }
++
++    #[test]
++    fn exclusive_excludes_then_hands_over() {
++        let k = key("exclusive_excludes_then_hands_over");
++        let first = next_id();
++        assert_eq!(
++            request(
++                k.clone(),
++                first,
++                Mode::Exclusive,
++                "a".into(),
++                false,
++                false,
++                Box::new(|| {})
++            ),
++            Outcome::Granted
++        );
++
++        let second = next_id();
++        let granted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let flag = granted.clone();
++        assert_eq!(
++            request(
++                k.clone(),
++                second,
++                Mode::Exclusive,
++                "b".into(),
++                false,
++                false,
++                Box::new(move || flag.store(true, Ordering::SeqCst))
++            ),
++            Outcome::Queued
++        );
++        assert!(!granted.load(Ordering::SeqCst));
++
++        release(&k, first);
++        assert!(granted.load(Ordering::SeqCst), "the waiter should be woken");
++        release(&k, second);
++    }
++
++    #[test]
++    fn shared_locks_share() {
++        let k = key("shared_locks_share");
++        let a = next_id();
++        let b = next_id();
++        for id in [a, b] {
++            assert_eq!(
++                request(
++                    k.clone(),
++                    id,
++                    Mode::Shared,
++                    "c".into(),
++                    false,
++                    false,
++                    Box::new(|| {})
++                ),
++                Outcome::Granted
++            );
++        }
++        release(&k, a);
++        release(&k, b);
++    }
++
++    #[test]
++    fn if_available_does_not_queue() {
++        let k = key("if_available_does_not_queue");
++        let held = next_id();
++        request(
++            k.clone(),
++            held,
++            Mode::Exclusive,
++            "d".into(),
++            false,
++            false,
++            Box::new(|| {}),
++        );
++        assert_eq!(
++            request(
++                k.clone(),
++                next_id(),
++                Mode::Exclusive,
++                "e".into(),
++                false,
++                true,
++                Box::new(|| {})
++            ),
++            Outcome::Unavailable
++        );
++        release(&k, held);
++    }
++
++    #[test]
++    fn steal_takes_it_from_the_holder() {
++        let k = key("steal_takes_it_from_the_holder");
++        let victim = next_id();
++        request(
++            k.clone(),
++            victim,
++            Mode::Exclusive,
++            "f".into(),
++            false,
++            false,
++            Box::new(|| {}),
++        );
++        let thief = next_id();
++        assert_eq!(
++            request(
++                k.clone(),
++                thief,
++                Mode::Exclusive,
++                "g".into(),
++                true,
++                false,
++                Box::new(|| {})
++            ),
++            Outcome::Granted
++        );
++        let (held, _) = snapshot("https://example.com");
++        let mine: Vec<_> = held
++            .iter()
++            .filter(|i| i.name == "steal_takes_it_from_the_holder")
++            .collect();
++        assert_eq!(mine.len(), 1, "the stolen holder should be gone");
++        assert_eq!(mine[0].client_id, "g");
++        release(&k, thief);
++    }
++}
+diff --git a/components/script/dom/workers/workernavigator.rs b/components/script/dom/workers/workernavigator.rs
+index 2cc59fa2d..1869f7112 100644
+--- a/components/script/dom/workers/workernavigator.rs
++++ b/components/script/dom/workers/workernavigator.rs
+@@ -16,6 +16,7 @@ use crate::dom::bindings::utils::to_frozen_array;
+ use crate::dom::navigator::hardware_concurrency;
+ use crate::dom::navigatorinfo;
+ use crate::dom::permissions::Permissions;
++use crate::dom::weblocks::lockmanager::LockManager;
+ use crate::dom::storagemanager::StorageManager;
+ #[cfg(feature = "webgpu")]
+ use crate::dom::webgpu::gpu::GPU;
+@@ -26,6 +27,7 @@ use crate::dom::workerglobalscope::WorkerGlobalScope;
+ pub(crate) struct WorkerNavigator {
+     reflector_: Reflector,
+     permissions: MutNullableDom<Permissions>,
++    locks: MutNullableDom<LockManager>,
+     storage: MutNullableDom<StorageManager>,
+     #[cfg(feature = "webgpu")]
+     gpu: MutNullableDom<GPU>,
+@@ -36,6 +38,7 @@ impl WorkerNavigator {
+         WorkerNavigator {
+             reflector_: Reflector::new(),
+             permissions: Default::default(),
++            locks: Default::default(),
+             storage: Default::default(),
+             #[cfg(feature = "webgpu")]
+             gpu: Default::default(),
+@@ -119,6 +122,12 @@ impl WorkerNavigatorMethods<crate::DomTypeHolder> for WorkerNavigator {
+             .or_init(|| Permissions::new(cx, &self.global()))
+     }
+ 
++    /// <https://w3c.github.io/web-locks/#navigator-mixins>
++    fn Locks(&self, cx: &mut JSContext) -> DomRoot<LockManager> {
++        self.locks
++            .or_init(|| LockManager::new(cx, &self.global()))
++    }
++
+     /// <https://storage.spec.whatwg.org/#api>
+     fn Storage(&self, cx: &mut JSContext) -> DomRoot<StorageManager> {
+         self.storage
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 24d0da65c..051393f79 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -967,9 +967,14 @@ DOMInterfaces = {
+     'useRcPromise': True,
+ },
+ 
++'LockManager': {
++    'cx': ['Request', 'Request_', 'Query'],
++    'useRcPromise': True,
++},
++
+ 'Navigator': {
+     'cx': ['Bluetooth', 'Credentials', 'Clipboard', 'Geolocation', 'Gpu', 'MimeTypes', 'Languages', 'SendBeacon', 'ServiceWorker', 'Servo',
+-        'Storage', 'Plugins', 'UserActivation', 'WakeLock', 'Xr', 'MediaDevices', 'MediaSession', 'Permissions', 'GetGamepads'],
++        'Storage', 'Plugins', 'UserActivation', 'WakeLock', 'Xr', 'MediaDevices', 'MediaSession', 'Permissions', 'GetGamepads', 'Locks'],
+ },
+ 
+ 'CredentialsContainer': {
+@@ -1529,7 +1534,7 @@ DOMInterfaces = {
+ },
+ 
+ 'WorkerNavigator': {
+-    'cx': ['Gpu', 'Languages', 'Storage', 'Permissions'],
++    'cx': ['Gpu', 'Languages', 'Storage', 'Permissions', 'Locks'],
+ },
+ 
+ 'Worklet': {
+diff --git a/components/script_bindings/webidls/Navigator.webidl b/components/script_bindings/webidls/Navigator.webidl
+index 9e28fbc81..4bc354d01 100644
+--- a/components/script_bindings/webidls/Navigator.webidl
++++ b/components/script_bindings/webidls/Navigator.webidl
+@@ -87,3 +87,8 @@ interface mixin NavigatorContentUtils {
+   [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined registerProtocolHandler(DOMString scheme, USVString url);
+   [Throws, SecureContext, Pref="dom_navigator_protocol_handlers_enabled"] undefined unregisterProtocolHandler(DOMString scheme, USVString url);
+ };
++
++// https://w3c.github.io/web-locks/#navigator-mixins
++partial interface Navigator {
++  [SecureContext, SameObject, Pref="dom_weblocks_enabled"] readonly attribute LockManager locks;
++};
+diff --git a/components/script_bindings/webidls/WebLocks.webidl b/components/script_bindings/webidls/WebLocks.webidl
+new file mode 100644
+index 000000000..e85cf1ff7
+--- /dev/null
++++ b/components/script_bindings/webidls/WebLocks.webidl
+@@ -0,0 +1,43 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
++
++// https://w3c.github.io/web-locks/#api-lock-manager
++
++[SecureContext, Exposed=(Window,Worker), Pref="dom_weblocks_enabled"]
++interface LockManager {
++  [NewObject] Promise<any> request(DOMString name, LockGrantedCallback callback);
++  [NewObject] Promise<any> request(DOMString name, LockOptions options, LockGrantedCallback callback);
++
++  [NewObject] Promise<LockManagerSnapshot> query();
++};
++
++callback LockGrantedCallback = Promise<any> (Lock? lock);
++
++enum LockMode { "shared", "exclusive" };
++
++dictionary LockOptions {
++  LockMode mode = "exclusive";
++  boolean ifAvailable = false;
++  boolean steal = false;
++  AbortSignal signal;
++};
++
++dictionary LockManagerSnapshot {
++  sequence<LockInfo> held;
++  sequence<LockInfo> pending;
++};
++
++dictionary LockInfo {
++  DOMString name;
++  LockMode mode;
++  DOMString clientId;
++};
++
++// https://w3c.github.io/web-locks/#api-lock
++
++[SecureContext, Exposed=(Window,Worker), Pref="dom_weblocks_enabled"]
++interface Lock {
++  readonly attribute DOMString name;
++  readonly attribute LockMode mode;
++};
+diff --git a/components/script_bindings/webidls/WorkerNavigator.webidl b/components/script_bindings/webidls/WorkerNavigator.webidl
+index 7e80fe9a0..8877d19e3 100644
+--- a/components/script_bindings/webidls/WorkerNavigator.webidl
++++ b/components/script_bindings/webidls/WorkerNavigator.webidl
+@@ -17,3 +17,9 @@ partial interface WorkerNavigator {
+   [Pref="dom_permissions_enabled"] readonly attribute Permissions permissions;
+ };
+ 
++
++// https://w3c.github.io/web-locks/#navigator-mixins
++[Exposed=Worker]
++partial interface WorkerNavigator {
++  [SecureContext, SameObject, Pref="dom_weblocks_enabled"] readonly attribute LockManager locks;
++};
+-- 
+2.52.0.windows.1
+
