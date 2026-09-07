@@ -1,0 +1,43 @@
+From 643698d9d9174ec72cdca37730716966b19196bb Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 00:01:45 -0500
+Subject: [PATCH 1/4] script_bindings: escape Rust keywords in promise method
+ wrappers
+
+The generated promise wrapper for a method called the wrapped extern fn by its
+raw IDL name, so an IDL method named `match` produced `match::<D>(...)`,
+which does not parse. The extern fn itself is already emitted under the
+keyword-escaped name (`match_`). Use the same escape when calling it.
+
+Found while adding Cache.match(); affects any promise-returning method whose
+name is a Rust keyword.
+---
+ components/script_bindings/codegen/codegen.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/components/script_bindings/codegen/codegen.py b/components/script_bindings/codegen/codegen.py
+index 1d4abfa42..c09a28f01 100644
+--- a/components/script_bindings/codegen/codegen.py
++++ b/components/script_bindings/codegen/codegen.py
+@@ -4673,10 +4673,17 @@ class CGMethodPromiseWrapper(CGAbstractExternMethod):
+             let cx = &mut cx;
+             return exception_to_promise(cx, (*args).rval());
+             """,
+-            methodName=self.method.identifier.name,
++            # The wrapped extern fn is emitted under its keyword-escaped name (a Rust
++            # keyword such as `match` becomes `match_`), so the call must use the same.
++            methodName=CGMethodPromiseWrapper.makeWrappedName(self.method),
+             args=", ".join(arg.name for arg in self.args),
+         ))
+ 
++    @staticmethod
++    def makeWrappedName(m: IDLMethod) -> str:
++        name = m.identifier.name
++        return f"{name}_" if name in RUST_KEYWORDS else name
++
+     @staticmethod
+     def makeNativeName(descriptor: Descriptor, m: IDLMethod) -> str:
+         return f"{m.identifier.name}_promise_wrapper"
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,106 @@
+[package]
+name = "whatsapp-rs"
+version = "0.1.0"
+edition = "2021"
+description = "WhatsApp Web as a small native tray app"
+
+[[bin]]
+name = "whatsapp"
+path = "src/main.rs"
+
+# The capability probe that established what works on each engine. Kept so the
+# findings stay reproducible rather than being a claim in a document.
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
+
+# Memory bench. Sweeps Chromium switches and WebView2 memory levels to find the
+# real floor, rather than asserting one.
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+# Deliberately dep-light. No image crate (icons are pre-converted to raw RGBA and
+# embedded), no serde (the geometry file is five key=value lines), no dirs crate
+# (about fifteen lines of std). Versions live-checked on crates.io 2026-09-06.
+[dependencies]
+# Safe mode: the OS webview and a tray icon.
+wry = "0.56.1"
+tao = "0.37.0"
+tray-icon = "0.24.2"
+muda = "0.19.3"
+
+# Light mode: WhatsApp's protocol with no browser at all.
+# `simd` is in whatsapp-rust's default features and is the ONLY thing in its tree
+# needing a nightly compiler (wacore-binary gates `feature(portable_simd)` on it),
+# so the rest of that default set is restored here by name and this builds on stable.
+whatsapp-rust = { version = "0.7", default-features = false, features = [
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "ureq-client",
+    "tokio-native",
+    "signal",
+] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
+qrcode = "0.14"
+
+# Light mode raises its own notifications; safe mode lets the webview do it.
+notify-rust = "4.18"
+
+# Windows-only: raw ICoreWebView2, needed to grant the Notifications permission
+# that WebView2 otherwise auto-denies, and to set the AppUserModelID that Windows
+# requires before it will render a toast at all.
+# windows MUST be 0.61 to match webview2-com 0.38.2's tree; 0.62 pulls a second
+# windows-strings and PWSTR silently becomes a different type.
+[target.'cfg(target_os = "windows")'.dependencies]
+webview2-com = "0.38.2"
+windows-core = "0.61"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows]
+version = "0.61"
+features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+  # TaskDialogIndirect: the native two-option picker shown on first launch.
+  "Win32_UI_Controls",
+  # The Start Menu shortcut carrying the AppUserModelID (shortcut.rs): IShellLinkW
+  # + IPersistFile + IPropertyStore, a VT_LPWSTR PROPVARIANT, and PKEY_AppUserModel_ID.
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Storage_EnhancedStorage",
+  "Win32_Storage_FileSystem",
+  # Light mode's chat window (chat_ui.rs): plain Win32 controls and GDI for the QR.
+  "Win32_Graphics_Gdi",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_HiDpi",
+  # Local time for message stamps; the bundled chrono has no clock feature.
+  "Win32_System_Time",
+  # WhatsApp's look (ui_theme.rs): GDI+ for anti-aliased shapes, DWM for the dark
+  # title bar, the registry for Windows' light/dark setting.
+  "Win32_Graphics_GdiPlus",
+  "Win32_Graphics_Dwm",
+  "Win32_System_Registry",
+]
+
+# Embeds the manifest that makes TaskDialogIndirect resolvable (Common Controls
+# v6). Without it the exe dies at load with STATUS_ENTRYPOINT_NOT_FOUND. See build.rs.
+[target.'cfg(target_os = "windows")'.build-dependencies]
+embed-manifest = "1.5.0"
+
+# Linux-only: raw webkit2gtk::WebView. v2_16 gates
+# initialize_notification_permissions, which is the only thing that actually
+# grants notifications on WebKitGTK. The permission-request signal never fires.
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = { version = "2.0.2", features = ["v2_16"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

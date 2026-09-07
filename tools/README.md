@@ -1,0 +1,25 @@
+# Test instruments
+
+Scripts that prove the claims in README.md and FINDINGS.md by running the built app. Each one
+was used for the numbers dated 2026-09-07. They expect `target\release\whatsapp.exe` to exist and
+Python 3 with `websocket-client` on PATH. Run from anywhere; paths are script-relative.
+
+| script | what it proves |
+| --- | --- |
+| `picker-drive.ps1 -Action Safe\|Light\|Cancel\|Escape\|List` | Launches `--choose`, screenshots the first-run picker, clicks the named button through UI Automation, and reports whether the process survived and what `mode.txt` says. Kills the app and clears the stored mode afterwards. |
+| `measure-modes.ps1 [-Wait 30]` | Working set and private bytes of each mode's whole process tree after a settle, then restores the data dir. |
+| `toast-test.ps1 [-What page\|sw\|both]` | The end-to-end toast proof: starts safe mode with a WebView2 debugging port, checks the Start Menu shortcut carries the AppUserModelID, fires a notification inside the real WhatsApp page over that port, screenshots the toast corner (`toast-<Tag>.png`), and lists what Windows' notification database accepted. |
+| `shot-br.ps1 -Out file.png` | Screenshot of the bottom-right of the primary screen, where toasts draw. |
+| `toast-db.py [N]` | The last N toasts Windows accepted, with the app identity each was filed under. Reads a copy of `wpndatabase.db`. This is the ground truth; the page's own "displayed" report is not. |
+| `cdp-notify.py PORT page\|sw\|both` | Requests the permission and fires the notification(s) in the page; prints the page's view. |
+| `cdp-eval.py PORT file.js` | Evaluates any awaited expression in the page. `survey.js` is the one that counted WhatsApp Web's notification API calls. |
+| `light-drive.ps1 -Mode demo\|pair [-Theme light\|dark]` | Light mode's window. `demo` opens it with sample chats and no network, moves it clear of overlays, clicks the first chat with a real mouse click (after printing what is under the cursor), types into the send box, presses Enter, screenshots before and after, and prints memory. `pair` opens the real thing as far as the QR (never scanned), screenshots it, and kills it. `-Theme` forces a palette through `WHATSAPP_RS_THEME`. |
+
+Two things learned building these, so nobody rebuilds the wrong instrument:
+
+- Watching for a toast window through UI Automation does not work on this Windows build (26200):
+  no `ShellExperienceHost` window ever appears; the shell lives in `ShellHost.exe`. Screenshot the
+  corner and read the database instead.
+- WebView2's debugging websocket refuses connections unless the runtime was started with
+  `--remote-allow-origins=*` as well as `--remote-debugging-port`. Both go in
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`; the app needs no code for this.

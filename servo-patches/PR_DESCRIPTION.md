@@ -1,0 +1,100 @@
+# Upstream PR text, ready to paste
+
+Branch: `cache-storage-complete` in `D:\NEWProjects\servo`, four commits on top of `main`
+(6c680f538, 2026-09-06). Patch files sit beside this file. All four apply cleanly with
+`git am`, `mach test-tidy` reports no errors, and the storage crate's unit tests pass.
+
+Servo's PR template asks for a "Part of" issue and a testing note per change; both are below.
+File one PR per commit or one PR with four commits; the first three are independent of the
+fourth and could land on their own.
+
+---
+
+## 1. script_bindings: escape Rust keywords in promise method wrappers
+
+The generated promise wrapper for a method called the wrapped extern fn by its raw IDL name,
+so an IDL method named `match` produced `match::<D>(...)`, which does not parse. The extern
+fn itself is already emitted under the keyword-escaped name (`match_`). The wrapper now uses
+the same escape.
+
+Found while adding `Cache.match()`. Affects any promise-returning method whose name is a Rust
+keyword.
+
+Testing: `Cache.webidl` with `match` now builds; no behaviour change for existing bindings
+(verified by a full build).
+
+Part of: #36538
+
+## 2. storage: scope IndexedDB index-name uniqueness to the object store
+
+`object_store_index` declared `name ... unique`, which made index names unique across the
+whole database. Per the IndexedDB spec, and the Firefox `DBSchema.cpp` this file is adapted
+from, an index name is only unique within its object store. A second store creating an index
+called `id` failed with `UNIQUE constraint failed: object_store_index.name` on `createIndex`.
+
+Reproduced with web.whatsapp.com, whose schema reuses index names across stores. The column
+constraint is replaced with `UNIQUE (object_store_id, name)`.
+
+Note for reviewers: the schema is only created when the SQLite file is first created. An
+existing profile written by an older build keeps the old constraint. IndexedDB is behind
+`dom_indexeddb_enabled` (default false), so I have not added a migration; say so if you want
+one.
+
+Testing: web.whatsapp.com's upgrade transaction now completes; previously it aborted.
+
+## 3. script: do not panic when clearing an absent IndexedDB upgrade transaction
+
+A backend error during an upgrade (for example the constraint failure above) can abort the
+transaction before it was recorded on the connection. `clear_upgrade_transaction` then hit an
+`.expect()` and took the script thread down, which the constellation reported as a page crash.
+A missing upgrade transaction is now treated as already cleared, with a warning.
+
+Testing: with commit 2 reverted, the same page now shows WhatsApp's own "database error"
+banner instead of crashing.
+
+## 4. serviceworker: implement Cache match/matchAll/add/addAll/put/delete and CacheStorage match/keys
+
+Completes the in-memory Cache Storage that #46247 and #47220 started, in the same files.
+
+- `Cache.webidl` / `CacheStorage.webidl`: the remaining spec methods and the
+  `MultiCacheQueryOptions` dictionary. `match` returns `Promise<(Response or undefined)>`,
+  the form already used by `ServiceWorkerContainer.getRegistration`.
+- `storage_traits`: cached entries cross to the storage thread as small serializable records
+  (`CacheRequestRecord`, `CacheResponseRecord`), because `net_traits::Request` is not
+  serializable. Bodies are fully read on the script side, as `put()` requires.
+- `storage`: Query Cache and Request Matches Cached Item per spec, including `ignoreSearch`,
+  `ignoreMethod`, `ignoreVary` and `Vary` header handling; the put and delete batch
+  operations; `CacheStorage.match`/`keys` in the spec's insertion order. Unit tests cover the
+  matching algorithm.
+- `script`: promise plumbing follows the existing callback and task pattern. Each pending
+  promise is tagged with the method it came from so replies resolve in the right shape.
+  `Cache.put` reads the body with `read_all_bytes`; `match` rebuilds a `Response` with an
+  immutable headers guard; `add`/`addAll` fetch, then put.
+
+Deliberately not in this PR: disk persistence (the engine is still in-memory, as #47220 left
+it), quota, and `AbortSignal` propagation through `add`. Those are follow-ups.
+
+Testing: `cargo test -p servo-storage --lib cache_storage` (5 tests). Manually, a
+`put`→`match` round trip on web.whatsapp.com returns the stored status, headers and body, and
+WhatsApp initialises its media store through `caches` instead of falling back to no-op
+storage.
+
+WPT, `service-workers/cache-storage/` run with `--pref dom_serviceworker_enabled=true`:
+**221 subtests went from expected-FAIL to PASS** (48 stayed PASS). The remaining gaps are
+honest and named:
+
+- `cache-add.*` error at the test level: `add`/`addAll` fetch the WPT server and something in
+  that path still fails. WhatsApp does not use `add`/`addAll` (it uses `open`/`match`/`put`/
+  `keys`), so this does not block the WhatsApp result, but it needs fixing before this is
+  spec-complete.
+- The `worker` / `serviceworker` / `sharedworker` variants time out, because full service
+  worker support is not turned on yet (`include.ini` still skips `[service-workers]`). The
+  `window` and `any.html` variants are the ones that pass.
+- A handful of PASS→FAIL subtests are regressions to chase (likely around
+  `getNotifications`-style edge cases and header echoing).
+
+Before merging I would regenerate `tests/wpt/meta/service-workers/cache-storage/*.ini` from a
+clean run so CI expectations match, and split the still-failing `add`/`addAll` into a
+follow-up. The expectation regeneration is not in these patches.
+
+Part of: #36538 (Implement ServiceWorker), closes #36072 (Implement window.caches).

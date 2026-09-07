@@ -1,0 +1,51 @@
+From cff1965c9204b4cafaea2e61853f68819e50284e Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 00:01:46 -0500
+Subject: [PATCH 2/4] storage: scope IndexedDB index-name uniqueness to the
+ object store
+
+The object_store_index table declared `name ... unique`, which made index
+names unique across the whole database. Per the IndexedDB spec (and the
+Firefox schema this file is adapted from) an index name is only unique within
+its object store, so a second store creating an index called `id` failed
+with a SQLite constraint violation on createIndex.
+
+Reproduced with web.whatsapp.com, whose schema reuses index names across
+stores. Replace the column constraint with UNIQUE (object_store_id, name).
+---
+ components/storage/indexeddb/engines/sqlite/create.rs | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/components/storage/indexeddb/engines/sqlite/create.rs b/components/storage/indexeddb/engines/sqlite/create.rs
+index c841b98b1..783d58202 100644
+--- a/components/storage/indexeddb/engines/sqlite/create.rs
++++ b/components/storage/indexeddb/engines/sqlite/create.rs
+@@ -37,17 +37,22 @@ create table object_data (
+ ) WITHOUT ROWID;"#;
+     conn.execute(OBJECT_DATA, [])?;
+ 
++    // An index name is unique within its object store, not across the database:
++    // <https://w3c.github.io/IndexedDB/#index-name>. Two stores may each have an
++    // index called "id", which a bare `unique` on `name` rejected with a constraint
++    // violation on the second `createIndex`. The composite constraint below matches
++    // the upstream Firefox schema this file is adapted from.
+     const OBJECT_STORE_INDEX: &str = r#"
+ create table object_store_index (
+     id                integer        not null
+     primary key autoincrement,
+     object_store_id   integer        not null
+     references object_store,
+-    name              varchar        not null
+-    unique,
++    name              varchar        not null,
+     key_path          varbinary_blob not null,
+     unique_index      boolean        not null,
+-    multi_entry_index boolean        not null
++    multi_entry_index boolean        not null,
++    unique (object_store_id, name)
+ );"#;
+     conn.execute(OBJECT_STORE_INDEX, [])?;
+ 
+-- 
+2.52.0.windows.1
+

@@ -1,0 +1,2410 @@
+From 5a3cedd16d428e565ced069c626da6f4ba7183f8 Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 00:01:47 -0500
+Subject: [PATCH 4/4] serviceworker: implement Cache
+ match/matchAll/add/addAll/put/delete and CacheStorage match/keys
+
+Completes the in-memory Cache Storage that #46247 and #47220 started.
+
+- Cache.webidl / CacheStorage.webidl: add the remaining spec methods and the
+  MultiCacheQueryOptions dictionary.
+- storage_traits: cached entries cross to the storage thread as small
+  serializable records (CacheRequestRecord / CacheResponseRecord), because
+  net_traits::Request is not serializable. Bodies are fully read on the script
+  side, as put() requires.
+- storage: implement Query Cache and Request Matches Cached Item per spec,
+  including ignoreSearch / ignoreMethod / ignoreVary and Vary header handling,
+  the put and delete batch operations, and CacheStorage match/keys with the
+  spec's insertion order. Unit tests cover the matching algorithm.
+- script: promise plumbing follows the existing callback/task pattern; each
+  pending promise is tagged with the method it came from so replies resolve in
+  the right shape. Cache.put reads the body with read_all_bytes; match rebuilds
+  a Response with an immutable headers guard; add/addAll fetch then put.
+
+With this, web.whatsapp.com initialises its media store instead of falling
+back to no-op storage, and (together with the IndexedDB fixes) renders its
+login QR code in Servo.
+---
+ components/script/dom/serviceworker/cache.rs  | 870 ++++++++++++++++--
+ .../script/dom/serviceworker/cachestorage.rs  | 358 ++++---
+ .../script_bindings/codegen/Bindings.conf     |   4 +-
+ .../script_bindings/webidls/Cache.webidl      |  11 +-
+ .../webidls/CacheStorage.webidl               |   9 +-
+ components/shared/storage/cache_storage.rs    | 104 ++-
+ components/storage/cache_storage.rs           | 647 ++++++++++++-
+ 7 files changed, 1758 insertions(+), 245 deletions(-)
+
+diff --git a/components/script/dom/serviceworker/cache.rs b/components/script/dom/serviceworker/cache.rs
+index d49078629..445b04b44 100644
+--- a/components/script/dom/serviceworker/cache.rs
++++ b/components/script/dom/serviceworker/cache.rs
+@@ -2,28 +2,61 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-use std::cell::RefCell;
++use std::cell::{Cell, RefCell};
+ use std::collections::VecDeque;
+ use std::rc::Rc;
+ 
++use bytes::Bytes;
+ use dom_struct::dom_struct;
++use http::header::{HeaderMap as HyperHeaders, HeaderName, HeaderValue};
++use hyper_serde::Serde;
+ use js::context::JSContext;
++use js::realm::CurrentRealm;
++use js::rust::HandleValue;
++use net_traits::http_status::HttpStatus;
+ use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+ use script_bindings::root::DomRoot;
+ use servo_base::generic_channel::{GenericCallback, GenericSend};
+ use servo_url::ServoUrl;
+-use storage_traits::cache_storage::{CacheStorageThreadMessage, CacheStorageThreadResponse};
++use storage_traits::cache_storage::{
++    CacheQueryOptionsRecord, CacheRequestRecord, CacheResponseRecord, CacheResponseType,
++    CacheStorageThreadMessage, CacheStorageThreadResponse,
++};
+ 
+ use crate::dom::Promise;
+ use crate::dom::bindings::codegen::Bindings::CacheBinding::CacheMethods;
++use crate::dom::bindings::codegen::Bindings::RequestBinding::{RequestInit, RequestMethods};
++use crate::dom::bindings::codegen::Bindings::ResponseBinding::{
++    ResponseMethods, ResponseType as DOMResponseType,
++};
+ use crate::dom::bindings::codegen::GenericBindings::CacheBinding::CacheQueryOptions;
+ use crate::dom::bindings::codegen::UnionTypes::RequestOrUSVString;
++use crate::dom::bindings::conversions::root_from_handlevalue;
+ use crate::dom::bindings::error::Error;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::str::DOMString;
++use crate::dom::fetch::headers::Guard;
+ use crate::dom::fetch::request::Request;
++use crate::dom::fetch::response::Response;
+ use crate::dom::globalscope::GlobalScope;
++use crate::dom::promise::promisenativehandler::{Callback, PromiseNativeHandler};
++use crate::fetch::body::BodyMixin;
++use crate::fetch::fetch::Fetch;
++
++/// Which method a pending backend reply belongs to, so `handle_response` resolves the
++/// promise in the shape that method promised. Replies arrive in the order requests were
++/// sent, because the storage thread handles messages sequentially.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum PendingOp {
++    Keys,
++    /// `match`: resolve with the first response, or undefined.
++    MatchFirst,
++    /// `matchAll`: resolve with every response.
++    MatchAll,
++    Put,
++    Delete,
++}
+ 
+ /// <https://w3c.github.io/ServiceWorker/#cache>
+ #[dom_struct]
+@@ -41,6 +74,123 @@ pub(crate) struct Cache {
+     // Dequeue of pending promises for backend operations.
+     #[conditional_malloc_size_of]
+     pending_promises: RefCell<VecDeque<Rc<Promise>>>,
++
++    /// Parallel to `pending_promises`: which method each pending promise came from.
++    #[no_trace]
++    #[ignore_malloc_size_of = "plain enum"]
++    pending_ops: RefCell<VecDeque<PendingOp>>,
++}
++
++/// Convert a header map into the (lowercase name, value) pairs the storage side stores.
++fn header_pairs(headers: &HyperHeaders) -> Vec<(String, String)> {
++    headers
++        .iter()
++        .map(|(name, value)| {
++            (
++                name.as_str().to_string(),
++                String::from_utf8_lossy(value.as_bytes()).into_owned(),
++            )
++        })
++        .collect()
++}
++
++/// Build a header map back out of stored pairs, skipping any pair that is no longer a
++/// valid header (which cannot happen for pairs that came from a real header map).
++fn header_map(pairs: &[(String, String)]) -> HyperHeaders {
++    let mut headers = HyperHeaders::new();
++    for (name, value) in pairs {
++        if let (Ok(name), Ok(value)) = (
++            HeaderName::from_bytes(name.as_bytes()),
++            HeaderValue::from_bytes(value.as_bytes()),
++        ) {
++            headers.append(name, value);
++        }
++    }
++    headers
++}
++
++/// The reduced form of a `Request` that the Cache Storage algorithms read.
++fn request_record(cx: &mut JSContext, request: &Request) -> CacheRequestRecord {
++    CacheRequestRecord {
++        url: request.Url().0,
++        method: String::from_utf8_lossy(&Vec::from(request.Method())).into_owned(),
++        headers: header_pairs(&request.Headers(cx).get_headers_list()),
++    }
++}
++
++fn query_options(options: &CacheQueryOptions) -> CacheQueryOptionsRecord {
++    CacheQueryOptionsRecord {
++        ignore_search: options.ignoreSearch,
++        ignore_method: options.ignoreMethod,
++        ignore_vary: options.ignoreVary,
++    }
++}
++
++/// The request half of the Cache algorithms' preamble:
++/// "If request is a Request object, set r to request's request. Else, set r to the
++/// associated request of the result of invoking the initial value of Request as
++/// constructor with request as its argument. If this throws, reject with it."
++fn request_from_info(
++    cx: &mut JSContext,
++    global: &GlobalScope,
++    request: RequestOrUSVString,
++) -> Result<DomRoot<Request>, Error> {
++    match request {
++        RequestOrUSVString::Request(request) => Ok(request),
++        RequestOrUSVString::USVString(request_string) => {
++            let base = global.api_base_url();
++            let Ok(url) = base.join(&request_string.0) else {
++                // Note: only the url parse can error.
++                return Err(Error::Type(c"Invalid URL".to_owned()));
++            };
++            Ok(Request::new(cx, global, None, url))
++        },
++    }
++}
++
++fn is_http_scheme(url: &str) -> bool {
++    ServoUrl::parse(url)
++        .map(|url| matches!(url.scheme(), "http" | "https"))
++        .unwrap_or(false)
++}
++
++/// Rebuild a `Response` object from a stored record, with an immutable headers guard, as
++/// <https://w3c.github.io/ServiceWorker/#cache-match> step 5.4.2 and friends require.
++pub(crate) fn response_from_record(
++    cx: &mut JSContext,
++    global: &GlobalScope,
++    record: &CacheResponseRecord,
++) -> DomRoot<Response> {
++    let response = Response::new(cx, global);
++    let response_type = match record.response_type {
++        CacheResponseType::Basic => DOMResponseType::Basic,
++        CacheResponseType::Cors => DOMResponseType::Cors,
++        CacheResponseType::Default => DOMResponseType::Default,
++        CacheResponseType::Error => DOMResponseType::Error,
++        CacheResponseType::Opaque => DOMResponseType::Opaque,
++        CacheResponseType::OpaqueRedirect => DOMResponseType::Opaqueredirect,
++    };
++    // Setting the type first lets the opaque and error cases clear status, headers
++    // and body the way the fetch spec's filtered responses are shaped.
++    response.set_type(cx, response_type);
++    let has_visible_body = !matches!(
++        response_type,
++        DOMResponseType::Error | DOMResponseType::Opaque | DOMResponseType::Opaqueredirect
++    );
++    if has_visible_body {
++        response.set_status(&HttpStatus::new_raw(
++            record.status,
++            record.status_text.clone(),
++        ));
++        response.set_headers(cx, Some(Serde(header_map(&record.headers))));
++        if let Ok(url) = ServoUrl::parse(&record.url) {
++            response.set_final_url(url);
++        }
++        response.stream_chunk(cx, Bytes::from(record.body.clone()));
++        response.finish(cx);
++    }
++    response.Headers(cx).set_guard(Guard::Immutable);
++    response
+ }
+ 
+ impl Cache {
+@@ -50,6 +200,7 @@ impl Cache {
+             name,
+             callback: Default::default(),
+             pending_promises: Default::default(),
++            pending_ops: Default::default(),
+         }
+     }
+ 
+@@ -91,80 +242,635 @@ impl Cache {
+         callback
+     }
+ 
++    /// Record a promise as waiting on the backend, paired with the method it came from.
++    fn push_pending(&self, promise: &Rc<Promise>, op: PendingOp) {
++        self.pending_promises
++            .borrow_mut()
++            .push_back(promise.clone());
++        self.pending_ops.borrow_mut().push_back(op);
++    }
++
++    fn pop_pending(&self) -> Option<(Rc<Promise>, PendingOp)> {
++        let promise = self.pending_promises.borrow_mut().pop_front()?;
++        let op = self
++            .pending_ops
++            .borrow_mut()
++            .pop_front()
++            .expect("pending_ops and pending_promises fell out of step");
++        Some((promise, op))
++    }
++
++    /// Send a message to the backend, or reject the promise if the storage thread is gone.
++    /// On success the promise is recorded as pending.
++    fn send_or_reject(
++        &self,
++        cx: &mut JSContext,
++        promise: &Rc<Promise>,
++        op: PendingOp,
++        message: CacheStorageThreadMessage,
++    ) {
++        if self.global().storage_threads().send(message).is_err() {
++            promise.reject_error(
++                cx,
++                Error::Operation(Some("Could not run the parallel steps.".to_string())),
++            );
++            return;
++        }
++        self.push_pending(promise, op);
++    }
++
+     fn handle_response(&self, cx: &mut JSContext, response: Option<CacheStorageThreadResponse>) {
+-        let response = match response {
+-            Some(response) => response,
+-            None => {
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    error!("No pending promise for Cache response.");
+-                    return;
+-                };
+-                promise.reject_error(
+-                    cx,
+-                    Error::Operation(Some("No response from Cache backend.".to_string())),
+-                );
+-                return;
+-            },
++        let Some((promise, op)) = self.pop_pending() else {
++            error!("No pending promise for Cache response.");
++            return;
++        };
++        let Some(response) = response else {
++            promise.reject_error(
++                cx,
++                Error::Operation(Some("No response from Cache backend.".to_string())),
++            );
++            return;
+         };
+-        match response {
++        let global = self.global();
++        match (op, response) {
+             // <https://w3c.github.io/ServiceWorker/#cache-keys>
+-            CacheStorageThreadResponse::KeysResult(results) => {
+-                // Step 5.4: Queue a task,
+-                // on promise’s relevant settings object’s responsible event loop using the DOM manipulation task source,
+-                // to perform the following steps:
++            (PendingOp::Keys, CacheStorageThreadResponse::KeysResult(results)) => {
++                // Step 5.4: Queue a task, on promise’s relevant settings object’s responsible
++                // event loop using the DOM manipulation task source, to perform the following steps:
+                 // Note: we are inside the task.
++                let records = match results {
++                    Ok(records) => records,
++                    Err(err) => {
++                        promise.reject_error(cx, Error::Operation(Some(err)));
++                        return;
++                    },
++                };
+ 
+                 // Step 5.4.1: Let requestList be a list.
+                 let mut request_list: Vec<DomRoot<Request>> = Vec::new();
+ 
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    debug_assert!(false, "No pending promise for Cache KeysResult response.");
+-                    return;
+-                };
+-
+                 // Step 5.4.2: For each request of requests:
+                 // Step 5.4.2.1: Add a new Request object associated with request
+                 // and a new associated Headers object whose guard is "immutable" to requestList.
+-                for url in results.unwrap_or_default() {
+-                    let Ok(url) = ServoUrl::parse(&url) else {
++                for record in records {
++                    let Ok(url) = ServoUrl::parse(&record.url) else {
+                         promise.reject_error(cx, Error::Type(c"Invalid URL".to_owned()));
+                         return;
+                     };
+-                    let request = Request::new(cx, &self.global(), None, url);
+-                    // TODO: associate request with a header.
++                    let request = Request::new(cx, &global, None, url);
++                    request.Headers(cx).set_headers(header_map(&record.headers));
++                    request.Headers(cx).set_guard(Guard::Immutable);
+                     request_list.push(request);
+                 }
+ 
+                 // Step 5.4.3: Resolve promise with a frozen array created from requestList, in realm.
+                 promise.resolve_native(cx, &request_list);
+             },
+-            CacheStorageThreadResponse::DeleteCacheResult(_result) => debug_assert!(
+-                false,
+-                "Unexpected DeleteCacheResult response in Cache handle_response."
+-            ),
+-            CacheStorageThreadResponse::HasCacheResult(_result) => debug_assert!(
+-                false,
+-                "Unexpected HasCacheResult response in Cache handle_response."
+-            ),
+-            CacheStorageThreadResponse::OpenCacheResult { .. } => debug_assert!(
+-                false,
+-                "Unexpected OpenCacheResult response in Cache handle_response."
+-            ),
++            // <https://w3c.github.io/ServiceWorker/#cache-match>
++            (PendingOp::MatchFirst, CacheStorageThreadResponse::MatchAllResult(results)) => {
++                match results {
++                    // Step 3: Return the result of reacting to promise with a fulfillment handler
++                    // that, when called with argument responses: if responses is empty, return
++                    // undefined; else return responses[0].
++                    Ok(records) => match records.first() {
++                        Some(record) => {
++                            let response = response_from_record(cx, &global, record);
++                            promise.resolve_native(cx, &response);
++                        },
++                        None => promise.resolve_native(cx, &()),
++                    },
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            // <https://w3c.github.io/ServiceWorker/#cache-matchall>
++            (PendingOp::MatchAll, CacheStorageThreadResponse::MatchAllResult(results)) => {
++                match results {
++                    Ok(records) => {
++                        // Step 5.4.1: Let responseList be a list.
++                        // Step 5.4.2: For each response of responses: add a new Response object
++                        // associated with response and a new associated Headers object whose
++                        // guard is "immutable" to responseList.
++                        let response_list: Vec<DomRoot<Response>> = records
++                            .iter()
++                            .map(|record| response_from_record(cx, &global, record))
++                            .collect();
++                        // Step 5.4.3: Resolve promise with a frozen array created from responseList.
++                        promise.resolve_native(cx, &response_list);
++                    },
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            // <https://w3c.github.io/ServiceWorker/#cache-put>
++            (PendingOp::Put, CacheStorageThreadResponse::PutResult(result)) => match result {
++                // Step 12: Return the result of reacting to promise with a fulfillment handler
++                // that returns undefined.
++                Ok(()) => promise.resolve_native(cx, &()),
++                Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++            },
++            // <https://w3c.github.io/ServiceWorker/#cache-delete>
++            (PendingOp::Delete, CacheStorageThreadResponse::DeleteEntryResult(result)) => {
++                match result {
++                    // Step 5: Return the result of reacting to promise with a fulfillment handler
++                    // that returns true if any entry was removed, false otherwise.
++                    Ok(deleted) => promise.resolve_native(cx, &deleted),
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            (op, response) => {
++                debug_assert!(
++                    false,
++                    "Unexpected backend response {:?} for pending Cache op {:?}.",
++                    response, op
++                );
++                promise.reject_error(
++                    cx,
++                    Error::Operation(Some("Mismatched Cache backend response.".to_string())),
++                );
++            },
++        }
++    }
++
++    /// Steps 1-7 of <https://w3c.github.io/ServiceWorker/#cache-put>: validate, then read the
++    /// whole body and hand the pair to the backend. The promise settles from `handle_response`.
++    fn put_request_response(
++        &self,
++        cx: &mut JSContext,
++        promise: &Rc<Promise>,
++        request: &Request,
++        response: &Response,
++    ) {
++        let global = self.global();
++        let request_record = request_record(cx, request);
++
++        // Step 2: If innerRequest’s url’s scheme is not one of "http" and "https", then
++        // return a promise rejected with a TypeError.
++        if !is_http_scheme(&request_record.url) {
++            promise.reject_error(
++                cx,
++                Error::Type(c"Request scheme must be http or https".to_owned()),
++            );
++            return;
++        }
++
++        // Step 3: If innerRequest’s method is not `GET`, return a promise rejected with a TypeError.
++        if !request_record.method.eq_ignore_ascii_case("GET") {
++            promise.reject_error(cx, Error::Type(c"Request method must be GET".to_owned()));
++            return;
++        }
++
++        // Step 4: Let innerResponse be response’s response.
++        let status = response.Status();
++        let response_headers = header_pairs(&response.Headers(cx).get_headers_list());
++
++        // Step 5: If innerResponse’s status is 206, return a promise rejected with a TypeError.
++        if status == 206 {
++            promise.reject_error(
++                cx,
++                Error::Type(c"Partial responses cannot be cached".to_owned()),
++            );
++            return;
++        }
++
++        // Step 6: If innerResponse’s header list contains `Vary`, then:
++        // Step 6.1: Let fieldValues be the list containing the elements corresponding to the
++        // field-values of the Vary header for the value of the header with name `Vary`.
++        // Step 6.2: For each fieldValue of fieldValues: if fieldValue matches "*", return a
++        // promise rejected with a TypeError.
++        for (name, value) in &response_headers {
++            if name.eq_ignore_ascii_case("vary") &&
++                value.split(',').any(|field| field.trim() == "*")
++            {
++                promise.reject_error(
++                    cx,
++                    Error::Type(c"Responses with Vary: * cannot be cached".to_owned()),
++                );
++                return;
++            }
++        }
++
++        // Step 7: If innerResponse’s body is disturbed or locked, return a promise rejected
++        // with a TypeError.
++        if response.is_unusable() {
++            promise.reject_error(
++                cx,
++                Error::Type(c"Response body is disturbed or locked".to_owned()),
++            );
++            return;
+         }
++
++        let response_type = match response.Type() {
++            DOMResponseType::Basic => CacheResponseType::Basic,
++            DOMResponseType::Cors => CacheResponseType::Cors,
++            DOMResponseType::Default => CacheResponseType::Default,
++            DOMResponseType::Error => CacheResponseType::Error,
++            DOMResponseType::Opaque => CacheResponseType::Opaque,
++            DOMResponseType::Opaqueredirect => CacheResponseType::OpaqueRedirect,
++        };
++        let response_record = CacheResponseRecord {
++            url: response.Url().0,
++            status,
++            status_text: Vec::from(response.StatusText()),
++            headers: response_headers,
++            body: Vec::new(),
++            response_type,
++        };
++
++        // Step 8: Let clonedResponse be the result of cloning innerResponse.
++        // Step 9: Let bodyReadPromise be a promise resolved with undefined.
++        // Step 10: If innerResponse’s body is non-null, then:
++        // Step 10.1: Let stream be innerResponse’s body’s stream.
++        // Step 10.2: Let reader be the result of getting a reader for stream.
++        // Step 10.3: Set bodyReadPromise to the result of reading all bytes from stream with reader.
++        // Note: the body is consumed here rather than cloned; this object is the only reader.
++        let Some(stream) = response.body() else {
++            let cache_name = self.name.to_string();
++            self.send_or_reject(
++                cx,
++                promise,
++                PendingOp::Put,
++                CacheStorageThreadMessage::Put {
++                    cache_name,
++                    callback: self.get_or_setup_callback(),
++                    origin: global.origin().immutable().clone(),
++                    request: request_record,
++                    response: response_record,
++                },
++            );
++            return;
++        };
++        let reader = match stream.acquire_default_reader(cx) {
++            Ok(reader) => reader,
++            Err(error) => {
++                promise.reject_error(cx, error);
++                return;
++            },
++        };
++
++        // Step 11: Let responseBodyPromise be a promise resolved with undefined. ...
++        // Step 12: Return the result of reacting to bodyReadPromise: run the batch cache
++        // operation with the fully read body.
++        let this = Trusted::new(self);
++        let success_promise = promise.clone();
++        let failure_promise = promise.clone();
++        reader.read_all_bytes(
++            cx,
++            Rc::new(move |cx, bytes| {
++                let cache = this.root();
++                let mut response_record = response_record.clone();
++                response_record.body = bytes.to_vec();
++                let cache_name = cache.name.to_string();
++                let origin = cache.global().origin().immutable().clone();
++                cache.send_or_reject(
++                    cx,
++                    &success_promise,
++                    PendingOp::Put,
++                    CacheStorageThreadMessage::Put {
++                        cache_name,
++                        callback: cache.get_or_setup_callback(),
++                        origin,
++                        request: request_record.clone(),
++                        response: response_record,
++                    },
++                );
++            }),
++            Rc::new(move |cx, value| {
++                failure_promise.reject(cx, value);
++            }),
++        );
++    }
++}
++
++/// The fulfillment side of one fetch inside `addAll`: put the fetched response, then
++/// settle the shared promise once every request has been put.
++#[derive(JSTraceable, MallocSizeOf)]
++struct AddAllFetchHandler {
++    #[ignore_malloc_size_of = "Trusted"]
++    cache: Trusted<Cache>,
++    #[no_trace]
++    #[ignore_malloc_size_of = "plain data"]
++    request: CacheRequestRecord,
++    #[conditional_malloc_size_of]
++    promise: Rc<Promise>,
++    #[ignore_malloc_size_of = "Rc<Cell>"]
++    remaining: Rc<Cell<usize>>,
++    #[ignore_malloc_size_of = "Rc<Cell>"]
++    failed: Rc<Cell<bool>>,
++}
++
++impl Callback for AddAllFetchHandler {
++    fn callback(&self, realm: &mut CurrentRealm, value: HandleValue) {
++        if self.failed.get() {
++            return;
++        }
++        let cx: &mut JSContext = realm;
++        let Ok(response) = root_from_handlevalue::<Response>(cx, value) else {
++            self.failed.set(true);
++            self.promise.reject_error(
++                cx,
++                Error::Type(c"fetch did not produce a Response".to_owned()),
++            );
++            return;
++        };
++        // <https://w3c.github.io/ServiceWorker/#cache-addall> step 5.3.3:
++        // If response’s type is "error", or response’s status is not an ok status,
++        // reject with a TypeError.
++        if response.Type() == DOMResponseType::Error || !response.Ok() {
++            self.failed.set(true);
++            self.promise.reject_error(
++                cx,
++                Error::Type(c"addAll fetched a non-ok response".to_owned()),
++            );
++            return;
++        }
++        let cache = self.cache.root();
++        let global = cache.global();
++        let Ok(url) = ServoUrl::parse(&self.request.url) else {
++            self.failed.set(true);
++            self.promise
++                .reject_error(cx, Error::Type(c"Invalid URL".to_owned()));
++            return;
++        };
++        let request = Request::new(cx, &global, None, url);
++        request
++            .Headers(cx)
++            .set_headers(header_map(&self.request.headers));
++        // Each put settles its own promise; the shared promise settles when the last one lands.
++        let put_promise = Promise::new(cx, &global);
++        cache.put_request_response(cx, &put_promise, &request, &response);
++        let remaining = self.remaining.get().saturating_sub(1);
++        self.remaining.set(remaining);
++        if remaining == 0 {
++            self.promise.resolve_native(cx, &());
++        }
++    }
++}
++
++/// The rejection side of one fetch inside `addAll`.
++#[derive(JSTraceable, MallocSizeOf)]
++struct AddAllFetchRejection {
++    #[conditional_malloc_size_of]
++    promise: Rc<Promise>,
++    #[ignore_malloc_size_of = "Rc<Cell>"]
++    failed: Rc<Cell<bool>>,
++}
++
++impl Callback for AddAllFetchRejection {
++    fn callback(&self, realm: &mut CurrentRealm, value: HandleValue) {
++        if self.failed.get() {
++            return;
++        }
++        self.failed.set(true);
++        let cx: &mut JSContext = realm;
++        self.promise.reject(cx, value);
+     }
+ }
+ 
+ impl CacheMethods<crate::DomTypeHolder> for Cache {
+-    /// <https://w3c.github.io/ServiceWorker/#dom-cache-keys>
+-    fn Keys(
++    /// <https://w3c.github.io/ServiceWorker/#cache-match>
++    fn Match(
++        &self,
++        cx: &mut JSContext,
++        request: RequestOrUSVString,
++        options: &CacheQueryOptions,
++    ) -> Rc<Promise> {
++        let global = self.global();
++        let promise = Promise::new(cx, &global);
++        // Step 1: Let p be a new promise.
++        // Step 2: Run these substeps in parallel: let promise be the result of running the
++        // algorithm specified in matchAll(request, options) ...
++        let request = match request_from_info(cx, &global, request) {
++            Ok(request) => request,
++            Err(error) => {
++                promise.reject_error(cx, error);
++                return promise;
++            },
++        };
++        let record = request_record(cx, &request);
++        let options = query_options(options);
++        // <https://w3c.github.io/ServiceWorker/#cache-matchall> step 2.2: If options["ignoreMethod"]
++        // is false and r’s method is not `GET`, resolve promise with an empty array (so `match`
++        // resolves with undefined).
++        if !options.ignore_method && !record.method.eq_ignore_ascii_case("GET") {
++            promise.resolve_native(cx, &());
++            return promise;
++        }
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::MatchFirst,
++            CacheStorageThreadMessage::MatchAll {
++                cache_name: self.name.to_string(),
++                callback: self.get_or_setup_callback(),
++                origin: global.origin().immutable().clone(),
++                request: Some(record),
++                options,
++            },
++        );
++        promise
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-matchall>
++    fn MatchAll(
+         &self,
+         cx: &mut JSContext,
+         request: Option<RequestOrUSVString>,
+-        _options: &CacheQueryOptions,
++        options: &CacheQueryOptions,
++    ) -> Rc<Promise> {
++        let global = self.global();
++        // Step 4: Let promise be a new promise.
++        let promise = Promise::new(cx, &global);
++        let options = query_options(options);
++        // Step 1: Let r be null.
++        // Step 2: If the optional argument request is not omitted, then:
++        let record = match request {
++            Some(request) => {
++                let request = match request_from_info(cx, &global, request) {
++                    Ok(request) => request,
++                    Err(error) => {
++                        promise.reject_error(cx, error);
++                        return promise;
++                    },
++                };
++                let record = request_record(cx, &request);
++                // Step 2.2: If options["ignoreMethod"] is false and r’s method is not `GET`,
++                // resolve promise with an empty array and abort these steps.
++                if !options.ignore_method && !record.method.eq_ignore_ascii_case("GET") {
++                    let empty: Vec<DomRoot<Response>> = Vec::new();
++                    promise.resolve_native(cx, &empty);
++                    return promise;
++                }
++                Some(record)
++            },
++            None => None,
++        };
++        // Step 5: Run these substeps in parallel:
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::MatchAll,
++            CacheStorageThreadMessage::MatchAll {
++                cache_name: self.name.to_string(),
++                callback: self.get_or_setup_callback(),
++                origin: global.origin().immutable().clone(),
++                request: record,
++                options,
++            },
++        );
++        promise
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-add>
++    fn Add(&self, cx: &mut JSContext, request: RequestOrUSVString) -> Rc<Promise> {
++        // Step 1: Let requests be an array containing only request.
++        // Step 2: Set responseArrayPromise to the result of running the algorithm specified
++        // in addAll(requests) passing requests as the argument.
++        self.AddAll(cx, vec![request])
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-addall>
++    fn AddAll(&self, cx: &mut JSContext, requests: Vec<RequestOrUSVString>) -> Rc<Promise> {
++        let global = self.global();
++        let promise = Promise::new(cx, &global);
++
++        // Step 1: Let responsePromises be an empty list.
++        // Step 2: Let requestList be an empty list.
++        // Step 3: For each request whose type is Request in requests: if request’s url’s scheme
++        // is not http/https, or request’s method is not `GET`, return a promise rejected with a TypeError.
++        // Step 4: Let fetchControllers be a list of the length of requests.
++        // Step 5: For each request in requests: set r to the result of invoking the initial
++        // value of Request as constructor with request; validate; fetch it.
++        let mut records: Vec<CacheRequestRecord> = Vec::with_capacity(requests.len());
++        for request in &requests {
++            let record = match request {
++                RequestOrUSVString::Request(request) => request_record(cx, request),
++                RequestOrUSVString::USVString(request_string) => {
++                    let Ok(url) = global.api_base_url().join(&request_string.0) else {
++                        promise.reject_error(cx, Error::Type(c"Invalid URL".to_owned()));
++                        return promise;
++                    };
++                    CacheRequestRecord {
++                        url: url.into_string(),
++                        method: "GET".to_string(),
++                        headers: Vec::new(),
++                    }
++                },
++            };
++            if !is_http_scheme(&record.url) {
++                promise.reject_error(
++                    cx,
++                    Error::Type(c"Request scheme must be http or https".to_owned()),
++                );
++                return promise;
++            }
++            if !record.method.eq_ignore_ascii_case("GET") {
++                promise.reject_error(cx, Error::Type(c"Request method must be GET".to_owned()));
++                return promise;
++            }
++            records.push(record);
++        }
++
++        if requests.is_empty() {
++            promise.resolve_native(cx, &());
++            return promise;
++        }
++
++        let remaining = Rc::new(Cell::new(requests.len()));
++        let failed = Rc::new(Cell::new(false));
++        for (request, record) in requests.into_iter().zip(records) {
++            let handler = PromiseNativeHandler::new(
++                cx,
++                &global,
++                Some(Box::new(AddAllFetchHandler {
++                    cache: Trusted::new(self),
++                    request: record,
++                    promise: promise.clone(),
++                    remaining: remaining.clone(),
++                    failed: failed.clone(),
++                })),
++                Some(Box::new(AddAllFetchRejection {
++                    promise: promise.clone(),
++                    failed: failed.clone(),
++                })),
++            );
++            let mut realm = CurrentRealm::assert(cx);
++            let fetch_promise = Fetch(&global, request, RequestInit::empty(), &mut realm);
++            fetch_promise.append_native_handler(&mut realm, &handler);
++        }
++        promise
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-put>
++    fn Put(
++        &self,
++        cx: &mut JSContext,
++        request: RequestOrUSVString,
++        response: &Response,
+     ) -> Rc<Promise> {
++        let global = self.global();
++        let promise = Promise::new(cx, &global);
++        // Step 1: Let innerRequest be request's request, or a new Request from the string.
++        let request = match request_from_info(cx, &global, request) {
++            Ok(request) => request,
++            Err(error) => {
++                promise.reject_error(cx, error);
++                return promise;
++            },
++        };
++        self.put_request_response(cx, &promise, &request, response);
++        promise
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-delete>
++    fn Delete(
++        &self,
++        cx: &mut JSContext,
++        request: RequestOrUSVString,
++        options: &CacheQueryOptions,
++    ) -> Rc<Promise> {
++        let global = self.global();
++        // Step 4: Let promise be a new promise.
++        let promise = Promise::new(cx, &global);
+         // Step 1: Let r be null.
+-        let mut r: Option<DomRoot<Request>> = None;
++        // Step 2: If request is a Request object, then set r to request’s request; if
++        // options["ignoreMethod"] is false and r’s method is not `GET`, return a promise
++        // resolved with false.
++        // Step 3: Else if request is a string, set r to the associated request of a new Request.
++        let request = match request_from_info(cx, &global, request) {
++            Ok(request) => request,
++            Err(error) => {
++                promise.reject_error(cx, error);
++                return promise;
++            },
++        };
++        let record = request_record(cx, &request);
++        let options = query_options(options);
++        if !options.ignore_method && !record.method.eq_ignore_ascii_case("GET") {
++            promise.resolve_native(cx, &false);
++            return promise;
++        }
++        // Step 5: Run these substeps in parallel: run the batch cache operation "delete".
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Delete,
++            CacheStorageThreadMessage::DeleteEntry {
++                cache_name: self.name.to_string(),
++                callback: self.get_or_setup_callback(),
++                origin: global.origin().immutable().clone(),
++                request: record,
++                options,
++            },
++        );
++        promise
++    }
+ 
++    /// <https://w3c.github.io/ServiceWorker/#dom-cache-keys>
++    fn Keys(
++        &self,
++        cx: &mut JSContext,
++        request: Option<RequestOrUSVString>,
++        options: &CacheQueryOptions,
++    ) -> Rc<Promise> {
+         // Step 3: Let realm be this’s relevant realm.
+         // Note: the global is used as the realm; step re-ordered to make it available in Step 2.
+         let global = self.global();
+@@ -172,54 +878,46 @@ impl CacheMethods<crate::DomTypeHolder> for Cache {
+         // Step 4: Let promise be a new promise.
+         // Note: step re-ordered to make it available in Step 2.
+         let promise = Promise::new(cx, &global);
++        let options = query_options(options);
+ 
++        // Step 1: Let r be null.
+         // Step 2: If the optional argument request is not omitted, then:
+-        if let Some(request) = request {
+-            // Step 2.1: If request is a Request object, then:
+-            if let RequestOrUSVString::Request(request) = request {
+-                // Step 2.1.1: Set r to request.
+-                r = Some(request);
+-            // Step 2.2: Else if request is a string, then:
+-            } else if let RequestOrUSVString::USVString(request_string) = request {
+-                // Step 2.2.1: Set r to the associated request of the result of
+-                // invoking the initial value of Request as
+-                // constructor with request as its argument.
+-                let Ok(url) = ServoUrl::parse(&request_string) else {
+-                    // If this throws an exception, return a promise rejected with that exception.
+-                    // Note: only the url parse can error.
+-                    promise.reject_error(cx, Error::Type(c"Invalid URL".to_owned()));
+-                    return promise;
++        let record = match request {
++            Some(request) => {
++                let request = match request_from_info(cx, &global, request) {
++                    Ok(request) => request,
++                    Err(error) => {
++                        // If this throws an exception, return a promise rejected with that exception.
++                        promise.reject_error(cx, error);
++                        return promise;
++                    },
+                 };
+-                let request = Request::new(cx, &global, None, url);
+-                r = Some(request);
+-            }
+-        }
+-
+-        // TODO: use r in the backend.
+-        let _ = r;
++                let record = request_record(cx, &request);
++                // Step 2.1.2: If options["ignoreMethod"] is false and r’s method is not `GET`,
++                // resolve promise with an empty array and abort these steps.
++                if !options.ignore_method && !record.method.eq_ignore_ascii_case("GET") {
++                    let empty: Vec<DomRoot<Request>> = Vec::new();
++                    promise.resolve_native(cx, &empty);
++                    return promise;
++                }
++                Some(record)
++            },
++            None => None,
++        };
+ 
+         // Step 5: Run these substeps in parallel:
+-        let callback = self.get_or_setup_callback();
+-        if global
+-            .storage_threads()
+-            .send(CacheStorageThreadMessage::Keys {
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Keys,
++            CacheStorageThreadMessage::Keys {
+                 cache_name: self.name.to_string(),
+-                callback,
++                callback: self.get_or_setup_callback(),
+                 origin: global.origin().immutable().clone(),
+-            })
+-            .is_err()
+-        {
+-            promise.reject_error(
+-                cx,
+-                Error::Operation(Some("Could not run the parallel steps.".to_string())),
+-            );
+-            return promise;
+-        }
+-
+-        self.pending_promises
+-            .borrow_mut()
+-            .push_back(promise.clone());
+-
++                request: record,
++                options,
++            },
++        );
+         promise
+     }
+ }
+diff --git a/components/script/dom/serviceworker/cachestorage.rs b/components/script/dom/serviceworker/cachestorage.rs
+index 421ec97f0..389719ddf 100644
+--- a/components/script/dom/serviceworker/cachestorage.rs
++++ b/components/script/dom/serviceworker/cachestorage.rs
+@@ -12,17 +12,34 @@ use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
+ use script_bindings::root::DomRoot;
+ use servo_base::generic_channel::{GenericCallback, GenericSend};
+ use servo_url::ImmutableOrigin;
+-use storage_traits::cache_storage::{CacheStorageThreadMessage, CacheStorageThreadResponse};
++use storage_traits::cache_storage::{
++    CacheQueryOptionsRecord, CacheRequestRecord, CacheStorageThreadMessage,
++    CacheStorageThreadResponse,
++};
+ use storage_traits::client_storage::{StorageIdentifier, StorageProxyMap, StorageType};
+ 
+ use crate::dom::Promise;
+ use crate::dom::bindings::codegen::Bindings::CacheStorageBinding::CacheStorageMethods;
++use crate::dom::bindings::codegen::Bindings::RequestBinding::RequestMethods;
++use crate::dom::bindings::codegen::GenericBindings::CacheStorageBinding::MultiCacheQueryOptions;
++use crate::dom::bindings::codegen::UnionTypes::RequestOrUSVString;
+ use crate::dom::bindings::error::Error;
+ use crate::dom::bindings::refcounted::Trusted;
+ use crate::dom::bindings::reflector::DomGlobal;
+ use crate::dom::bindings::str::DOMString;
++use crate::dom::fetch::request::Request;
+ use crate::dom::globalscope::GlobalScope;
+-use crate::dom::serviceworker::cache::Cache;
++use crate::dom::serviceworker::cache::{Cache, response_from_record};
++
++/// Which method a pending backend reply belongs to. See `Cache::PendingOp`.
++#[derive(Clone, Copy, Debug, PartialEq)]
++enum PendingOp {
++    Has,
++    Open,
++    Delete,
++    Match,
++    Keys,
++}
+ 
+ /// <https://w3c.github.io/ServiceWorker/#cachestorage>
+ #[dom_struct]
+@@ -36,6 +53,11 @@ pub(crate) struct CacheStorage {
+     // Dequeue of pending promises for backend operations.
+     #[conditional_malloc_size_of]
+     pending_promises: RefCell<VecDeque<Rc<Promise>>>,
++
++    /// Parallel to `pending_promises`: which method each pending promise came from.
++    #[no_trace]
++    #[ignore_malloc_size_of = "plain enum"]
++    pending_ops: RefCell<VecDeque<PendingOp>>,
+ }
+ 
+ impl CacheStorage {
+@@ -44,6 +66,7 @@ impl CacheStorage {
+             reflector_: Reflector::new(),
+             callback: Default::default(),
+             pending_promises: Default::default(),
++            pending_ops: Default::default(),
+         }
+     }
+ 
+@@ -85,92 +108,127 @@ impl CacheStorage {
+         callback
+     }
+ 
++    fn push_pending(&self, promise: &Rc<Promise>, op: PendingOp) {
++        self.pending_promises
++            .borrow_mut()
++            .push_back(promise.clone());
++        self.pending_ops.borrow_mut().push_back(op);
++    }
++
++    fn pop_pending(&self) -> Option<(Rc<Promise>, PendingOp)> {
++        let promise = self.pending_promises.borrow_mut().pop_front()?;
++        let op = self
++            .pending_ops
++            .borrow_mut()
++            .pop_front()
++            .expect("pending_ops and pending_promises fell out of step");
++        Some((promise, op))
++    }
++
++    /// Send a message to the backend, or reject the promise if the storage thread is gone.
++    /// On success the promise is recorded as pending.
++    fn send_or_reject(
++        &self,
++        cx: &mut JSContext,
++        promise: &Rc<Promise>,
++        op: PendingOp,
++        message: CacheStorageThreadMessage,
++    ) {
++        if self.global().storage_threads().send(message).is_err() {
++            promise.reject_error(
++                cx,
++                Error::Operation(Some("Could not run the parallel steps.".to_string())),
++            );
++            return;
++        }
++        self.push_pending(promise, op);
++    }
++
+     fn handle_response(&self, cx: &mut JSContext, response: Option<CacheStorageThreadResponse>) {
+-        let response = match response {
+-            Some(response) => response,
+-            None => {
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    error!("No pending promise for CacheStorage response.");
+-                    return;
+-                };
+-                promise.reject_error(
+-                    cx,
+-                    Error::Operation(Some("No response from CacheStorage backend.".to_string())),
+-                );
+-                return;
+-            },
++        let Some((promise, op)) = self.pop_pending() else {
++            error!("No pending promise for CacheStorage response.");
++            return;
+         };
+-        match response {
++        let Some(response) = response else {
++            promise.reject_error(
++                cx,
++                Error::Operation(Some("No response from CacheStorage backend.".to_string())),
++            );
++            return;
++        };
++        let global = self.global();
++        match (op, response) {
+             // <https://w3c.github.io/ServiceWorker/#cache-storage-has>
+             // the steps resolving the promise with the result.
+             // Note: spec forgets to queue a task see <https://github.com/w3c/ServiceWorker/issues/1831>
+-            CacheStorageThreadResponse::HasCacheResult(result) => {
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    debug_assert!(false, "No pending promise for HasCacheResult response.");
+-                    return;
+-                };
+-                let Ok(has_cache) = result else {
+-                    promise.reject_error(
+-                        cx,
+-                        Error::Operation(Some(
+-                            result
+-                                .err()
+-                                .unwrap_or_else(|| "HasCacheResult error".to_string()),
+-                        )),
+-                    );
+-                    return;
+-                };
++            (PendingOp::Has, CacheStorageThreadResponse::HasCacheResult(result)) => match result {
+                 // Step 2.1:For each key → value of the relevant name to cache map:
+                 // Step 2.1.1: If cacheName matches key, resolve promise with true and abort these steps.
+                 // Step 2.2: Resolve promise with false.
+                 // Note: promise resolved with the result obtained in parallel.
+-                promise.resolve_native(cx, &has_cache);
++                Ok(has_cache) => promise.resolve_native(cx, &has_cache),
++                Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
+             },
+             // <https://w3c.github.io/ServiceWorker/#cache-storage-open>
+             // the steps resolving the promise with the result.
+-            CacheStorageThreadResponse::OpenCacheResult { result, cache_name } => {
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    debug_assert!(false, "No pending promise for OpenCacheResult response.");
+-                    return;
+-                };
+-                if result.is_err() {
+-                    promise.reject_error(
+-                        cx,
+-                        Error::Operation(Some(
+-                            result
+-                                .err()
+-                                .unwrap_or_else(|| "OpenCacheResult error".to_string()),
+-                        )),
+-                    );
+-                    return;
+-                };
+-                // Resolve promise with a new Cache object that represents value.
+-                let cache = Cache::new(cx, &self.global(), DOMString::from(cache_name));
+-                promise.resolve_native(cx, &cache);
++            (
++                PendingOp::Open,
++                CacheStorageThreadResponse::OpenCacheResult { result, cache_name },
++            ) => {
++                match result {
++                    Ok(()) => {
++                        // Resolve promise with a new Cache object that represents value.
++                        let cache = Cache::new(cx, &global, DOMString::from(cache_name));
++                        promise.resolve_native(cx, &cache);
++                    },
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
+             },
+             // <https://w3c.github.io/ServiceWorker/#dom-cachestorage-delete>
+-            CacheStorageThreadResponse::DeleteCacheResult(result) => {
+-                let Some(promise) = self.pending_promises.borrow_mut().pop_front() else {
+-                    debug_assert!(false, "No pending promise for DeleteCacheResult response.");
+-                    return;
+-                };
+-                let Ok(deleted) = result else {
+-                    promise.reject_error(
+-                        cx,
+-                        Error::Operation(Some(
+-                            result
+-                                .err()
+-                                .unwrap_or_else(|| "DeleteCacheResult error".to_string()),
+-                        )),
+-                    );
+-                    return;
+-                };
+-                promise.resolve_native(cx, &deleted);
++            (PendingOp::Delete, CacheStorageThreadResponse::DeleteCacheResult(result)) => {
++                match result {
++                    Ok(deleted) => promise.resolve_native(cx, &deleted),
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            // <https://w3c.github.io/ServiceWorker/#cache-storage-match>
++            (PendingOp::Match, CacheStorageThreadResponse::CacheStorageMatchResult(result)) => {
++                match result {
++                    // Step 4.2.1.2: If promise resolves with a response, resolve with it.
++                    // Step 4.2.2: Resolve promise with undefined.
++                    Ok(Some(record)) => {
++                        let response = response_from_record(cx, &global, &record);
++                        promise.resolve_native(cx, &response);
++                    },
++                    Ok(None) => promise.resolve_native(cx, &()),
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            // <https://w3c.github.io/ServiceWorker/#cache-storage-keys>
++            (PendingOp::Keys, CacheStorageThreadResponse::CacheStorageKeysResult(result)) => {
++                match result {
++                    // Step 2.3: Resolve promise with keys.
++                    Ok(names) => {
++                        let names: Vec<DOMString> =
++                            names.into_iter().map(DOMString::from).collect();
++                        promise.resolve_native(cx, &names);
++                    },
++                    Err(err) => promise.reject_error(cx, Error::Operation(Some(err))),
++                }
++            },
++            (op, response) => {
++                debug_assert!(
++                    false,
++                    "Unexpected backend response {:?} for pending CacheStorage op {:?}.",
++                    response, op
++                );
++                promise.reject_error(
++                    cx,
++                    Error::Operation(Some(
++                        "Mismatched CacheStorage backend response.".to_string(),
++                    )),
++                );
+             },
+-            CacheStorageThreadResponse::KeysResult(_) => debug_assert!(
+-                false,
+-                "Unexpected KeysResult response in CacheStorage handle_response."
+-            ),
+         }
+     }
+ }
+@@ -207,6 +265,71 @@ fn relevant_name_to_cache_map(
+ }
+ 
+ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-match>
++    fn Match(
++        &self,
++        cx: &mut JSContext,
++        request: RequestOrUSVString,
++        options: &MultiCacheQueryOptions,
++    ) -> Rc<Promise> {
++        let global = self.global();
++        // Step 1: If options["cacheName"] exists: let promise be a new promise; else
++        // Step 2: Let promise be a new promise.
++        let promise = Promise::new(cx, &global);
++        // The request preamble shared with Cache.match: a Request object's request, or a
++        // new Request from the string, rejecting if construction throws.
++        let request = match request {
++            RequestOrUSVString::Request(request) => request,
++            RequestOrUSVString::USVString(request_string) => {
++                let Ok(url) = global.api_base_url().join(&request_string.0) else {
++                    promise.reject_error(cx, Error::Type(c"Invalid URL".to_owned()));
++                    return promise;
++                };
++                Request::new(cx, &global, None, url)
++            },
++        };
++        let record = CacheRequestRecord {
++            url: request.Url().0,
++            method: String::from_utf8_lossy(&Vec::from(request.Method())).into_owned(),
++            headers: request
++                .Headers(cx)
++                .get_headers_list()
++                .iter()
++                .map(|(name, value)| {
++                    (
++                        name.as_str().to_string(),
++                        String::from_utf8_lossy(value.as_bytes()).into_owned(),
++                    )
++                })
++                .collect(),
++        };
++        let query = CacheQueryOptionsRecord {
++            ignore_search: options.parent.ignoreSearch,
++            ignore_method: options.parent.ignoreMethod,
++            ignore_vary: options.parent.ignoreVary,
++        };
++        // <https://w3c.github.io/ServiceWorker/#cache-matchall> step 2.2 applies through
++        // Cache.match: a non-GET request with ignoreMethod false resolves with undefined.
++        if !query.ignore_method && !record.method.eq_ignore_ascii_case("GET") {
++            promise.resolve_native(cx, &());
++            return promise;
++        }
++        // Step 3/4: Run these substeps in parallel, in the relevant name to cache map.
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Match,
++            CacheStorageThreadMessage::CacheStorageMatch {
++                callback: self.get_or_setup_callback(),
++                origin: global.origin().immutable().clone(),
++                request: record,
++                options: query,
++                cache_name: options.cacheName.as_ref().map(|name| name.to_string()),
++            },
++        );
++        promise
++    }
++
+     /// <https://w3c.github.io/ServiceWorker/#cache-storage-has>
+     fn Has(&self, cx: &mut JSContext, cache_name: DOMString) -> Rc<Promise> {
+         let global = self.global();
+@@ -224,27 +347,17 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
+                 return promise;
+             },
+         };
+-        if global
+-            .storage_threads()
+-            .send(CacheStorageThreadMessage::HasCache {
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Has,
++            CacheStorageThreadMessage::HasCache {
+                 cache_name: cache_name.to_string(),
+                 callback,
+                 proxy: proxy_map,
+                 origin,
+-            })
+-            .is_err()
+-        {
+-            promise.reject_error(
+-                cx,
+-                Error::Operation(Some("Could not run the parallel steps.".to_string())),
+-            );
+-            return promise;
+-        }
+-
+-        self.pending_promises
+-            .borrow_mut()
+-            .push_back(promise.clone());
+-
++            },
++        );
+         promise
+     }
+ 
+@@ -264,26 +377,17 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
+                 return promise;
+             },
+         };
+-        if global
+-            .storage_threads()
+-            .send(CacheStorageThreadMessage::OpenCache {
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Open,
++            CacheStorageThreadMessage::OpenCache {
+                 cache_name: cache_name.to_string(),
+                 callback,
+                 proxy: proxy_map,
+                 origin,
+-            })
+-            .is_err()
+-        {
+-            promise.reject_error(
+-                cx,
+-                Error::Operation(Some("Could not run the parallel steps.".to_string())),
+-            );
+-            return promise;
+-        }
+-
+-        self.pending_promises
+-            .borrow_mut()
+-            .push_back(promise.clone());
++            },
++        );
+ 
+         // Step 3: Return promise.
+         promise
+@@ -312,28 +416,38 @@ impl CacheStorageMethods<crate::DomTypeHolder> for CacheStorage {
+                 return promise;
+             },
+         };
+-        if global
+-            .storage_threads()
+-            .send(CacheStorageThreadMessage::DeleteCache {
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Delete,
++            CacheStorageThreadMessage::DeleteCache {
+                 cache_name: cache_name.to_string(),
+                 callback,
+                 proxy: proxy_map,
+                 origin,
+-            })
+-            .is_err()
+-        {
+-            promise.reject_error(
+-                cx,
+-                Error::Operation(Some("Could not run the parallel steps.".to_string())),
+-            );
+-            return promise;
+-        }
+-
+-        self.pending_promises
+-            .borrow_mut()
+-            .push_back(promise.clone());
++            },
++        );
+ 
+         // Step 4: Return cacheJobPromise.
+         promise
+     }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-keys>
++    fn Keys(&self, cx: &mut JSContext) -> Rc<Promise> {
++        let global = self.global();
++        // Step 1: Let promise be a new promise.
++        let promise = Promise::new(cx, &global);
++        // Step 2: Run the following steps in parallel:
++        self.send_or_reject(
++            cx,
++            &promise,
++            PendingOp::Keys,
++            CacheStorageThreadMessage::CacheStorageKeys {
++                callback: self.get_or_setup_callback(),
++                origin: global.origin().immutable().clone(),
++            },
++        );
++        // Step 3: Return promise.
++        promise
++    }
+ }
+diff --git a/components/script_bindings/codegen/Bindings.conf b/components/script_bindings/codegen/Bindings.conf
+index 2ff62b78b..24d0da65c 100644
+--- a/components/script_bindings/codegen/Bindings.conf
++++ b/components/script_bindings/codegen/Bindings.conf
+@@ -106,12 +106,12 @@ DOMInterfaces = {
+ },
+ 
+ 'CacheStorage': {
+-    'cx': ['Has', 'Open', 'Delete'],
++    'cx': ['Match', 'Has', 'Open', 'Delete', 'Keys'],
+     'useRcPromise': True,
+ },
+ 
+ 'Cache': {
+-    'cx': ['Keys'],
++    'cx': ['Match', 'MatchAll', 'Add', 'AddAll', 'Put', 'Delete', 'Keys'],
+     'useRcPromise': True,
+ },
+ 
+diff --git a/components/script_bindings/webidls/Cache.webidl b/components/script_bindings/webidls/Cache.webidl
+index c8a728bd7..1b45af900 100644
+--- a/components/script_bindings/webidls/Cache.webidl
++++ b/components/script_bindings/webidls/Cache.webidl
+@@ -2,11 +2,16 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-// https://w3c.github.io/ServiceWorker/#cache
++// https://w3c.github.io/ServiceWorker/#cache-interface
++
+ [Pref="dom_serviceworker_enabled", SecureContext, Exposed=(Window,Worker)]
+ interface Cache {
+-  // [NewObject] Promise<FrozenArray<Request>> keys(optional RequestInfo request, optional CacheQueryOptions options = {});
+-  // Workaround until FrozenArray get implemented.
++  [NewObject] Promise<(Response or undefined)> match(RequestInfo request, optional CacheQueryOptions options = {});
++  [NewObject] Promise<sequence<Response>> matchAll(optional RequestInfo request, optional CacheQueryOptions options = {});
++  [NewObject] Promise<undefined> add(RequestInfo request);
++  [NewObject] Promise<undefined> addAll(sequence<RequestInfo> requests);
++  [NewObject] Promise<undefined> put(RequestInfo request, Response response);
++  [NewObject] Promise<boolean> delete(RequestInfo request, optional CacheQueryOptions options = {});
+   [NewObject] Promise<sequence<Request>> keys(optional RequestInfo request, optional CacheQueryOptions options = {});
+ };
+ 
+diff --git a/components/script_bindings/webidls/CacheStorage.webidl b/components/script_bindings/webidls/CacheStorage.webidl
+index a18d7e63d..b052b436c 100644
+--- a/components/script_bindings/webidls/CacheStorage.webidl
++++ b/components/script_bindings/webidls/CacheStorage.webidl
+@@ -2,10 +2,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
+ 
+-// https://w3c.github.io/ServiceWorker/#cachestorage
++// https://w3c.github.io/ServiceWorker/#cachestorage-interface
++
+ [Pref="dom_serviceworker_enabled", SecureContext, Exposed=(Window,Worker)]
+ interface CacheStorage {
++  [NewObject] Promise<(Response or undefined)> match(RequestInfo request, optional MultiCacheQueryOptions options = {});
+   [NewObject] Promise<boolean> has(DOMString cacheName);
+   [NewObject] Promise<Cache> open(DOMString cacheName);
+   [NewObject] Promise<boolean> delete(DOMString cacheName);
++  [NewObject] Promise<sequence<DOMString>> keys();
++};
++
++dictionary MultiCacheQueryOptions : CacheQueryOptions {
++  DOMString cacheName;
+ };
+diff --git a/components/shared/storage/cache_storage.rs b/components/shared/storage/cache_storage.rs
+index 2bb6613bc..7d93c9b52 100644
+--- a/components/shared/storage/cache_storage.rs
++++ b/components/shared/storage/cache_storage.rs
+@@ -53,6 +53,58 @@ impl DerefMut for CacheStorageThreadHandle {
+     }
+ }
+ 
++/// The subset of a [request](https://fetch.spec.whatwg.org/#concept-request) that the
++/// Cache Storage algorithms read: its URL, its method, and its header list.
++///
++/// A `net_traits::request::Request` is not serializable, and a cached entry must cross
++/// to the storage thread and back, so cached entries are stored in this reduced form.
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct CacheRequestRecord {
++    /// The serialized URL of the request.
++    pub url: String,
++    /// The request method, e.g. `GET`.
++    pub method: String,
++    /// The header list, as (lowercase name, value) pairs in original order.
++    pub headers: Vec<(String, String)>,
++}
++
++/// The type of a cached [response](https://fetch.spec.whatwg.org/#concept-response-type).
++#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
++pub enum CacheResponseType {
++    Basic,
++    Cors,
++    Default,
++    Error,
++    Opaque,
++    OpaqueRedirect,
++}
++
++/// The subset of a [response](https://fetch.spec.whatwg.org/#concept-response) that
++/// the Cache Storage algorithms read and that is needed to rebuild a `Response` object.
++#[derive(Clone, Debug, Deserialize, Serialize)]
++pub struct CacheResponseRecord {
++    /// The serialized URL of the response.
++    pub url: String,
++    /// The HTTP status code.
++    pub status: u16,
++    /// The HTTP status message.
++    pub status_text: Vec<u8>,
++    /// The header list, as (lowercase name, value) pairs in original order.
++    pub headers: Vec<(String, String)>,
++    /// The fully read body.
++    pub body: Vec<u8>,
++    /// The response type.
++    pub response_type: CacheResponseType,
++}
++
++/// <https://w3c.github.io/ServiceWorker/#dictdef-cachequeryoptions>
++#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
++pub struct CacheQueryOptionsRecord {
++    pub ignore_search: bool,
++    pub ignore_method: bool,
++    pub ignore_vary: bool,
++}
++
+ #[derive(Clone, Debug, Deserialize, Serialize)]
+ pub enum CacheStorageThreadMessage {
+     /// <https://w3c.github.io/ServiceWorker/#cache-storage-has>
+@@ -74,6 +126,9 @@ pub enum CacheStorageThreadMessage {
+         cache_name: String,
+         callback: GenericCallback<CacheStorageThreadResponse>,
+         origin: ImmutableOrigin,
++        /// The optional request to query with; `None` returns every cached request.
++        request: Option<CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
+     },
+     DeleteCache {
+         cache_name: String,
+@@ -81,6 +136,48 @@ pub enum CacheStorageThreadMessage {
+         proxy: StorageProxyMap,
+         origin: ImmutableOrigin,
+     },
++    /// <https://w3c.github.io/ServiceWorker/#cache-matchall>
++    /// Also serves `match`, which is `matchAll` truncated to its first result.
++    MatchAll {
++        cache_name: String,
++        callback: GenericCallback<CacheStorageThreadResponse>,
++        origin: ImmutableOrigin,
++        /// The optional request to query with; `None` returns every cached response.
++        request: Option<CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
++    },
++    /// <https://w3c.github.io/ServiceWorker/#cache-put>
++    /// The "put" case of <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>.
++    Put {
++        cache_name: String,
++        callback: GenericCallback<CacheStorageThreadResponse>,
++        origin: ImmutableOrigin,
++        request: CacheRequestRecord,
++        response: CacheResponseRecord,
++    },
++    /// <https://w3c.github.io/ServiceWorker/#cache-delete>
++    /// The "delete" case of <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>.
++    DeleteEntry {
++        cache_name: String,
++        callback: GenericCallback<CacheStorageThreadResponse>,
++        origin: ImmutableOrigin,
++        request: CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    },
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-match>
++    CacheStorageMatch {
++        callback: GenericCallback<CacheStorageThreadResponse>,
++        origin: ImmutableOrigin,
++        request: CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++        /// `MultiCacheQueryOptions.cacheName`, restricting the search to one cache.
++        cache_name: Option<String>,
++    },
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-keys>
++    CacheStorageKeys {
++        callback: GenericCallback<CacheStorageThreadResponse>,
++        origin: ImmutableOrigin,
++    },
+     Exit(GenericSender<()>),
+ }
+ 
+@@ -91,6 +188,11 @@ pub enum CacheStorageThreadResponse {
+         result: Result<(), String>,
+         cache_name: String,
+     },
+-    KeysResult(Result<Vec<String>, String>),
++    KeysResult(Result<Vec<CacheRequestRecord>, String>),
+     DeleteCacheResult(Result<bool, String>),
++    MatchAllResult(Result<Vec<CacheResponseRecord>, String>),
++    PutResult(Result<(), String>),
++    DeleteEntryResult(Result<bool, String>),
++    CacheStorageMatchResult(Result<Option<CacheResponseRecord>, String>),
++    CacheStorageKeysResult(Result<Vec<String>, String>),
+ }
+diff --git a/components/storage/cache_storage.rs b/components/storage/cache_storage.rs
+index 2dfe50b9d..990764360 100644
+--- a/components/storage/cache_storage.rs
++++ b/components/storage/cache_storage.rs
+@@ -8,13 +8,11 @@ use std::path::PathBuf;
+ use std::thread;
+ 
+ use log::error;
+-use net_traits::request::Request;
+-use net_traits::response::Response;
+ use servo_base::generic_channel::{self, GenericReceiver, GenericSender};
+ use servo_url::ImmutableOrigin;
+ use storage_traits::cache_storage::{
+-    CacheStorageError, CacheStorageThreadHandle, CacheStorageThreadMessage,
+-    CacheStorageThreadResponse,
++    CacheQueryOptionsRecord, CacheRequestRecord, CacheResponseRecord, CacheStorageError,
++    CacheStorageThreadHandle, CacheStorageThreadMessage, CacheStorageThreadResponse,
+ };
+ use storage_traits::client_storage::StorageProxyMap;
+ 
+@@ -41,7 +39,9 @@ trait CacheStorageEngine {
+         &mut self,
+         origin: ImmutableOrigin,
+         cache_name: &str,
+-    ) -> Result<Vec<String>, CacheStorageError<Self::Error>>;
++        request: Option<&CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Vec<CacheRequestRecord>, CacheStorageError<Self::Error>>;
+ 
+     /// <https://w3c.github.io/ServiceWorker/#dom-cachestorage-delete>
+     fn delete_cache(
+@@ -50,17 +50,189 @@ trait CacheStorageEngine {
+         cache_name: &str,
+         proxy_map: &StorageProxyMap,
+     ) -> Result<bool, CacheStorageError<Self::Error>>;
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-matchall>
++    fn match_all(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: Option<&CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Vec<CacheResponseRecord>, CacheStorageError<Self::Error>>;
++
++    /// The "put" case of
++    /// <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>
++    fn put(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: CacheRequestRecord,
++        response: CacheResponseRecord,
++    ) -> Result<(), CacheStorageError<Self::Error>>;
++
++    /// The "delete" case of
++    /// <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>
++    fn delete_entry(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: &CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<bool, CacheStorageError<Self::Error>>;
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-match>
++    fn cache_storage_match(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: Option<&str>,
++        request: &CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Option<CacheResponseRecord>, CacheStorageError<Self::Error>>;
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-keys>
++    fn cache_storage_keys(
++        &mut self,
++        origin: ImmutableOrigin,
++    ) -> Result<Vec<String>, CacheStorageError<Self::Error>>;
+ }
+ 
+ /// <https://w3c.github.io/ServiceWorker/#dfn-request-response-list>
+ pub struct RequestResponseList {
+     /// A list of tuples consisting of a request (a request) and a response (a response)
+-    pub list: Vec<(Request, Response)>,
++    pub list: Vec<(CacheRequestRecord, CacheResponseRecord)>,
++}
++
++/// Strip the fragment, and optionally the query, from a serialized URL.
++///
++/// The URLs stored here are already serialized by the URL parser on the script side,
++/// so the `#` and `?` delimiters are unambiguous and no re-parse is needed.
++fn url_for_comparison(url: &str, ignore_search: bool) -> &str {
++    let without_fragment = url.split('#').next().unwrap_or(url);
++    if ignore_search {
++        without_fragment
++            .split('?')
++            .next()
++            .unwrap_or(without_fragment)
++    } else {
++        without_fragment
++    }
++}
++
++/// The [combined value](https://fetch.spec.whatwg.org/#concept-header-list-combine) of
++/// every header named `name` in `headers`, or `None` if there is no such header.
++fn combined_header_value(headers: &[(String, String)], name: &str) -> Option<String> {
++    let values: Vec<&str> = headers
++        .iter()
++        .filter(|(n, _)| n.eq_ignore_ascii_case(name))
++        .map(|(_, v)| v.as_str())
++        .collect();
++    if values.is_empty() {
++        None
++    } else {
++        Some(values.join(", "))
++    }
++}
++
++/// <https://w3c.github.io/ServiceWorker/#request-matches-cached-item-algorithm>
++fn request_matches_cached_item(
++    request_query: &CacheRequestRecord,
++    request: &CacheRequestRecord,
++    response: Option<&CacheResponseRecord>,
++    options: CacheQueryOptionsRecord,
++) -> bool {
++    // Step 1: If options["ignoreMethod"] is false and request’s method is not `GET`, return false.
++    if !options.ignore_method && !request.method.eq_ignore_ascii_case("GET") {
++        return false;
++    }
++
++    // Step 2: Let queryURL be requestQuery’s url.
++    // Step 3: Let cachedURL be request’s url.
++    // Step 4: If options["ignoreSearch"] is true, then set cachedURL’s query and queryURL’s query to empty.
++    // Step 5: If queryURL does not equal cachedURL with the exclude fragments flag set, return false.
++    if url_for_comparison(&request_query.url, options.ignore_search) !=
++        url_for_comparison(&request.url, options.ignore_search)
++    {
++        return false;
++    }
++
++    // Step 6: If response is null, options["ignoreVary"] is true,
++    // or response’s header list does not contain `Vary`, return true.
++    let Some(response) = response else {
++        return true;
++    };
++    if options.ignore_vary {
++        return true;
++    }
++    let Some(vary) = combined_header_value(&response.headers, "vary") else {
++        return true;
++    };
++
++    // Step 7: Let fieldValues be the list containing the elements corresponding to
++    // the field-values of the Vary header for the value of the header with name `Vary`.
++    // Step 8: For each fieldValue of fieldValues:
++    for field_value in vary.split(',').map(str::trim).filter(|s| !s.is_empty()) {
++        // Step 8.1: If fieldValue matches "*", return false.
++        if field_value == "*" {
++            return false;
++        }
++        // Step 8.2: If the combined value given fieldValue and request’s header list does
++        // not match the combined value given fieldValue and requestQuery’s header list, return false.
++        if combined_header_value(&request.headers, field_value) !=
++            combined_header_value(&request_query.headers, field_value)
++        {
++            return false;
++        }
++    }
++
++    // Step 9: Return true.
++    true
++}
++
++impl RequestResponseList {
++    /// <https://w3c.github.io/ServiceWorker/#query-cache>
++    ///
++    /// Returns the indices of every entry whose request matches `request_query`.
++    fn query(
++        &self,
++        request_query: &CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    ) -> Vec<usize> {
++        self.list
++            .iter()
++            .enumerate()
++            .filter(|(_, (request, response))| {
++                request_matches_cached_item(request_query, request, Some(response), options)
++            })
++            .map(|(index, _)| index)
++            .collect()
++    }
+ }
+ 
+ pub struct MemCacheStorageEngine {
+     /// <https://w3c.github.io/ServiceWorker/#dfn-name-to-cache-map>
+     name_to_cache_map: HashMap<(ImmutableOrigin, String), RequestResponseList>,
++    /// The insertion order of `name_to_cache_map`, which the spec's `match` and `keys`
++    /// algorithms on CacheStorage observe.
++    cache_order: Vec<(ImmutableOrigin, String)>,
++}
++
++impl MemCacheStorageEngine {
++    fn new() -> Self {
++        MemCacheStorageEngine {
++            name_to_cache_map: Default::default(),
++            cache_order: Vec::new(),
++        }
++    }
++
++    fn relevant_cache_mut(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++    ) -> Result<&mut RequestResponseList, CacheStorageError<()>> {
++        self.name_to_cache_map
++            .get_mut(&(origin, cache_name.to_string()))
++            .ok_or(CacheStorageError::Internal(()))
++    }
+ }
+ 
+ impl CacheStorageEngine for MemCacheStorageEngine {
+@@ -119,7 +291,9 @@ impl CacheStorageEngine for MemCacheStorageEngine {
+         if response.is_err() {
+             return Err(CacheStorageError::Internal(()));
+         }
+-        self.name_to_cache_map.insert((origin, cache_name), cache);
++        let key = (origin, cache_name);
++        self.name_to_cache_map.insert(key.clone(), cache);
++        self.cache_order.push(key);
+ 
+         // Step 2.4: Resolve promise with a new Cache object that represents cache.
+         // Note: promise resolved in script.
+@@ -132,27 +306,32 @@ impl CacheStorageEngine for MemCacheStorageEngine {
+         &mut self,
+         origin: ImmutableOrigin,
+         cache_name: &str,
+-    ) -> Result<Vec<String>, CacheStorageError<Self::Error>> {
+-        // Step 5.1: Let requests be an empty list.
+-        let mut requests: Vec<String> = Vec::new();
++        request: Option<&CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Vec<CacheRequestRecord>, CacheStorageError<Self::Error>> {
++        let relevant_cache = self.relevant_cache_mut(origin, cache_name)?;
+ 
++        // Step 5.1: Let requests be an empty list.
+         // Step 5.2: If the optional argument request is omitted, then:
+         // Step 5.2.1: For each requestResponse of the relevant request response list:
+-        let Some(relevant_cache) = self
+-            .name_to_cache_map
+-            .get(&(origin, cache_name.to_string()))
+-        else {
+-            return Err(CacheStorageError::Internal(()));
+-        };
+         // Step 5.2.2: Add requestResponse’s request to requests.
+-        for (request, _response) in &relevant_cache.list {
+-            requests.push(request.url().to_string());
+-        }
++        let Some(request) = request else {
++            return Ok(relevant_cache
++                .list
++                .iter()
++                .map(|(request, _)| request.clone())
++                .collect());
++        };
+ 
+         // Step 5.3: Else:
+-        // Note: implementing this steps depends on Query Cache; todo.
+-
+-        Ok(requests)
++        // Step 5.3.1: Let requestResponses be the result of running Query Cache with r and options.
++        // Step 5.3.2: For each requestResponse of requestResponses:
++        // Step 5.3.2.1: Add requestResponse’s request to requests.
++        Ok(relevant_cache
++            .query(request, options)
++            .into_iter()
++            .map(|index| relevant_cache.list[index].0.clone())
++            .collect())
+     }
+ 
+     /// <https://w3c.github.io/ServiceWorker/#dom-cachestorage-delete>
+@@ -175,12 +354,11 @@ impl CacheStorageEngine for MemCacheStorageEngine {
+ 
+         // Step 2.3: Run the following substeps in parallel:
+         // Step 2.3.1: Remove the relevant name to cache map[cacheName].
+-        let has = self
+-            .name_to_cache_map
+-            .remove(&(origin, cache_name.to_string()))
+-            .is_some();
++        let key = (origin, cache_name.to_string());
++        let has = self.name_to_cache_map.remove(&key).is_some();
+ 
+         if has {
++            self.cache_order.retain(|entry| entry != &key);
+             let Ok(response) = proxy
+                 .handle
+                 .delete_database(proxy.bottle_id, cache_name.to_string())
+@@ -197,6 +375,156 @@ impl CacheStorageEngine for MemCacheStorageEngine {
+         // Note: promise resolved in script.
+         Ok(has)
+     }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-matchall>
++    /// The parallel steps.
++    fn match_all(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: Option<&CacheRequestRecord>,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Vec<CacheResponseRecord>, CacheStorageError<Self::Error>> {
++        let relevant_cache = self.relevant_cache_mut(origin, cache_name)?;
++
++        // Step 5.1: Let responses be an empty list.
++        // Step 5.2: If the optional argument request is omitted, then:
++        // Step 5.2.1: For each requestResponse of the relevant request response list:
++        // Step 5.2.1.1: Add requestResponse’s response to responses.
++        let Some(request) = request else {
++            return Ok(relevant_cache
++                .list
++                .iter()
++                .map(|(_, response)| response.clone())
++                .collect());
++        };
++
++        // Step 5.3: Else:
++        // Step 5.3.1: Let requestResponses be the result of running Query Cache with r and options.
++        // Step 5.3.2: For each requestResponse of requestResponses:
++        // Step 5.3.2.1: Add requestResponse’s response to responses.
++        Ok(relevant_cache
++            .query(request, options)
++            .into_iter()
++            .map(|index| relevant_cache.list[index].1.clone())
++            .collect())
++    }
++
++    /// The "put" case of
++    /// <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>
++    fn put(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: CacheRequestRecord,
++        response: CacheResponseRecord,
++    ) -> Result<(), CacheStorageError<Self::Error>> {
++        let relevant_cache = self.relevant_cache_mut(origin, cache_name)?;
++
++        // Step 5.4.2: If operation’s type matches "put", then:
++        // Step 5.4.2.4: Let requestResponses be the result of running Query Cache with operation’s request.
++        // Step 5.4.2.5: For each requestResponse of requestResponses:
++        // Step 5.4.2.5.1: Remove requestResponse from cache.
++        let existing = relevant_cache.query(&request, CacheQueryOptionsRecord::default());
++        for index in existing.into_iter().rev() {
++            relevant_cache.list.remove(index);
++        }
++
++        // Step 5.4.2.6: Append operation’s request and response to cache.
++        // If this cache write operation failed due to exceeding the granted quota limit,
++        // throw a QuotaExceededError.
++        // Note: there are no quota checks storage side at this point.
++        relevant_cache.list.push((request, response));
++        Ok(())
++    }
++
++    /// The "delete" case of
++    /// <https://w3c.github.io/ServiceWorker/#batch-cache-operations-algorithm>
++    fn delete_entry(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: &str,
++        request: &CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<bool, CacheStorageError<Self::Error>> {
++        let relevant_cache = self.relevant_cache_mut(origin, cache_name)?;
++
++        // Step 5.4.1: If operation’s type matches "delete", then:
++        // Step 5.4.1.3: Let requestResponses be the result of running Query Cache with operation’s request and operation’s options.
++        // Step 5.4.1.4: For each requestResponse of requestResponses:
++        // Step 5.4.1.4.1: Remove requestResponse from cache.
++        let matches = relevant_cache.query(request, options);
++        let deleted = !matches.is_empty();
++        for index in matches.into_iter().rev() {
++            relevant_cache.list.remove(index);
++        }
++        Ok(deleted)
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-match>
++    /// The parallel steps.
++    fn cache_storage_match(
++        &mut self,
++        origin: ImmutableOrigin,
++        cache_name: Option<&str>,
++        request: &CacheRequestRecord,
++        options: CacheQueryOptionsRecord,
++    ) -> Result<Option<CacheResponseRecord>, CacheStorageError<Self::Error>> {
++        // Step 3: If options["cacheName"] exists, then:
++        if let Some(cache_name) = cache_name {
++            // Step 3.1.1: For each key → value of the relevant name to cache map:
++            // Step 3.1.1.1: If options["cacheName"] matches key, then:
++            // Step 3.1.1.1.1: Resolve promise with the result of running the algorithm specified in
++            // match(request, options) method of Cache interface with request and options.
++            // Step 3.1.2: Resolve promise with undefined.
++            let Some(cache) = self
++                .name_to_cache_map
++                .get(&(origin, cache_name.to_string()))
++            else {
++                return Ok(None);
++            };
++            return Ok(cache
++                .query(request, options)
++                .first()
++                .map(|&index| cache.list[index].1.clone()));
++        }
++
++        // Step 4: Else:
++        // Step 4.2.1: For each key → value of the relevant name to cache map:
++        // Step 4.2.1.1: Let promise be the result of running the algorithm specified in
++        // match(request, options) method of Cache interface with request and options.
++        // Step 4.2.1.2: If promise resolves with a response, resolve with that response.
++        // Step 4.2.2: Resolve promise with undefined.
++        for key in &self.cache_order {
++            if key.0 != origin {
++                continue;
++            }
++            let Some(cache) = self.name_to_cache_map.get(key) else {
++                continue;
++            };
++            if let Some(&index) = cache.query(request, options).first() {
++                return Ok(Some(cache.list[index].1.clone()));
++            }
++        }
++        Ok(None)
++    }
++
++    /// <https://w3c.github.io/ServiceWorker/#cache-storage-keys>
++    /// The parallel steps.
++    fn cache_storage_keys(
++        &mut self,
++        origin: ImmutableOrigin,
++    ) -> Result<Vec<String>, CacheStorageError<Self::Error>> {
++        // Step 2.1: Let keys be an empty list.
++        // Step 2.2: For each key → value of the relevant name to cache map:
++        // Step 2.2.1: Append key to keys.
++        Ok(self
++            .cache_order
++            .iter()
++            .filter(|(entry_origin, _)| *entry_origin == origin)
++            .map(|(_, name)| name.clone())
++            .collect())
++    }
+ }
+ 
+ pub trait CacheStorageThreadFactory {
+@@ -229,9 +557,7 @@ impl CacheStorageThreadFactory for CacheStorageThreadHandle {
+             .spawn(move || {
+                 // Keep temp_dir alive while the thread runs.
+                 let _ = temp_dir;
+-                let engine = MemCacheStorageEngine {
+-                    name_to_cache_map: Default::default(),
+-                };
++                let engine = MemCacheStorageEngine::new();
+                 let mut cache_storage_thread =
+                     CacheStorageThread::new(sender_clone, generic_receiver, engine);
+                 cache_storage_thread.start();
+@@ -307,8 +633,12 @@ where
+                     cache_name,
+                     callback,
+                     origin,
++                    request,
++                    options,
+                 } => {
+-                    let result = self.engine.keys(origin.clone(), &cache_name);
++                    let result =
++                        self.engine
++                            .keys(origin.clone(), &cache_name, request.as_ref(), options);
+                     if callback
+                         .send(CacheStorageThreadResponse::KeysResult(
+                             result.map_err(|e| format!("{:?}", e)),
+@@ -336,6 +666,99 @@ where
+                         error!("Failed to send response to script for DeleteCache message.");
+                     }
+                 },
++                CacheStorageThreadMessage::MatchAll {
++                    cache_name,
++                    callback,
++                    origin,
++                    request,
++                    options,
++                } => {
++                    let result = self.engine.match_all(
++                        origin.clone(),
++                        &cache_name,
++                        request.as_ref(),
++                        options,
++                    );
++                    if callback
++                        .send(CacheStorageThreadResponse::MatchAllResult(
++                            result.map_err(|e| format!("{:?}", e)),
++                        ))
++                        .is_err()
++                    {
++                        error!("Failed to send response to script for MatchAll message.");
++                    }
++                },
++                CacheStorageThreadMessage::Put {
++                    cache_name,
++                    callback,
++                    origin,
++                    request,
++                    response,
++                } => {
++                    let result = self
++                        .engine
++                        .put(origin.clone(), &cache_name, request, response);
++                    if callback
++                        .send(CacheStorageThreadResponse::PutResult(
++                            result.map_err(|e| format!("{:?}", e)),
++                        ))
++                        .is_err()
++                    {
++                        error!("Failed to send response to script for Put message.");
++                    }
++                },
++                CacheStorageThreadMessage::DeleteEntry {
++                    cache_name,
++                    callback,
++                    origin,
++                    request,
++                    options,
++                } => {
++                    let result =
++                        self.engine
++                            .delete_entry(origin.clone(), &cache_name, &request, options);
++                    if callback
++                        .send(CacheStorageThreadResponse::DeleteEntryResult(
++                            result.map_err(|e| format!("{:?}", e)),
++                        ))
++                        .is_err()
++                    {
++                        error!("Failed to send response to script for DeleteEntry message.");
++                    }
++                },
++                CacheStorageThreadMessage::CacheStorageMatch {
++                    callback,
++                    origin,
++                    request,
++                    options,
++                    cache_name,
++                } => {
++                    let result = self.engine.cache_storage_match(
++                        origin.clone(),
++                        cache_name.as_deref(),
++                        &request,
++                        options,
++                    );
++                    if callback
++                        .send(CacheStorageThreadResponse::CacheStorageMatchResult(
++                            result.map_err(|e| format!("{:?}", e)),
++                        ))
++                        .is_err()
++                    {
++                        error!("Failed to send response to script for CacheStorageMatch message.");
++                    }
++                },
++                CacheStorageThreadMessage::CacheStorageKeys { callback, origin } => {
++                    let result = self.engine.cache_storage_keys(origin.clone());
++                    if callback
++                        .send(CacheStorageThreadResponse::CacheStorageKeysResult(
++                            result.map_err(|e| format!("{:?}", e)),
++                        ))
++                        .is_err()
++                    {
++                        error!("Failed to send response to script for CacheStorageKeys message.");
++                    }
++                },
+                 CacheStorageThreadMessage::Exit(sender) => {
+                     let _ = sender.send(());
+                     break;
+@@ -344,3 +767,167 @@ where
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use storage_traits::cache_storage::CacheResponseType;
++
++    use super::*;
++
++    fn request(url: &str, method: &str, headers: &[(&str, &str)]) -> CacheRequestRecord {
++        CacheRequestRecord {
++            url: url.to_string(),
++            method: method.to_string(),
++            headers: headers
++                .iter()
++                .map(|(n, v)| (n.to_string(), v.to_string()))
++                .collect(),
++        }
++    }
++
++    fn response(headers: &[(&str, &str)]) -> CacheResponseRecord {
++        CacheResponseRecord {
++            url: "https://example.com/".to_string(),
++            status: 200,
++            status_text: b"OK".to_vec(),
++            headers: headers
++                .iter()
++                .map(|(n, v)| (n.to_string(), v.to_string()))
++                .collect(),
++            body: b"body".to_vec(),
++            response_type: CacheResponseType::Basic,
++        }
++    }
++
++    fn opts(
++        ignore_search: bool,
++        ignore_method: bool,
++        ignore_vary: bool,
++    ) -> CacheQueryOptionsRecord {
++        CacheQueryOptionsRecord {
++            ignore_search,
++            ignore_method,
++            ignore_vary,
++        }
++    }
++
++    #[test]
++    fn url_comparison_strips_fragment_and_optionally_query() {
++        assert_eq!(
++            url_for_comparison("https://a/b?x=1#frag", false),
++            "https://a/b?x=1"
++        );
++        assert_eq!(
++            url_for_comparison("https://a/b?x=1#frag", true),
++            "https://a/b"
++        );
++        assert_eq!(url_for_comparison("https://a/b", true), "https://a/b");
++    }
++
++    #[test]
++    fn matches_same_url_and_differs_on_query_unless_ignored() {
++        let cached = request("https://a/b?x=1", "GET", &[]);
++        let same = request("https://a/b?x=1#other", "GET", &[]);
++        let other_query = request("https://a/b?x=2", "GET", &[]);
++        assert!(request_matches_cached_item(
++            &same,
++            &cached,
++            None,
++            opts(false, false, false)
++        ));
++        assert!(!request_matches_cached_item(
++            &other_query,
++            &cached,
++            None,
++            opts(false, false, false)
++        ));
++        assert!(request_matches_cached_item(
++            &other_query,
++            &cached,
++            None,
++            opts(true, false, false)
++        ));
++    }
++
++    #[test]
++    fn non_get_cached_request_never_matches_unless_method_ignored() {
++        let cached = request("https://a/b", "POST", &[]);
++        let query = request("https://a/b", "GET", &[]);
++        assert!(!request_matches_cached_item(
++            &query,
++            &cached,
++            None,
++            opts(false, false, false)
++        ));
++        assert!(request_matches_cached_item(
++            &query,
++            &cached,
++            None,
++            opts(false, true, false)
++        ));
++    }
++
++    #[test]
++    fn vary_header_is_honoured() {
++        let cached = request("https://a/b", "GET", &[("accept", "text/html")]);
++        let resp = response(&[("vary", "Accept")]);
++        let same_accept = request("https://a/b", "GET", &[("accept", "text/html")]);
++        let other_accept = request("https://a/b", "GET", &[("accept", "image/png")]);
++        assert!(request_matches_cached_item(
++            &same_accept,
++            &cached,
++            Some(&resp),
++            opts(false, false, false)
++        ));
++        assert!(!request_matches_cached_item(
++            &other_accept,
++            &cached,
++            Some(&resp),
++            opts(false, false, false)
++        ));
++        // ignoreVary makes the Accept mismatch irrelevant.
++        assert!(request_matches_cached_item(
++            &other_accept,
++            &cached,
++            Some(&resp),
++            opts(false, false, true)
++        ));
++        // A Vary of "*" never matches.
++        let star = response(&[("vary", "*")]);
++        assert!(!request_matches_cached_item(
++            &same_accept,
++            &cached,
++            Some(&star),
++            opts(false, false, false)
++        ));
++    }
++
++    #[test]
++    fn put_replaces_matching_entries_and_delete_reports_presence() {
++        let mut list = RequestResponseList { list: Vec::new() };
++        list.list
++            .push((request("https://a/b", "GET", &[]), response(&[])));
++        list.list
++            .push((request("https://a/c", "GET", &[]), response(&[])));
++        // A second put of the same URL must replace, not duplicate.
++        let query = request("https://a/b", "GET", &[]);
++        let existing = list.query(&query, CacheQueryOptionsRecord::default());
++        assert_eq!(existing, vec![0]);
++        for index in existing.into_iter().rev() {
++            list.list.remove(index);
++        }
++        list.list.push((
++            request("https://a/b", "GET", &[]),
++            response(&[("x", "new")]),
++        ));
++        assert_eq!(list.list.len(), 2);
++        assert_eq!(
++            list.query(&query, CacheQueryOptionsRecord::default()),
++            vec![1]
++        );
++        assert_eq!(
++            list.list[1].1.headers,
++            vec![("x".to_string(), "new".to_string())]
++        );
++    }
++}
+-- 
+2.52.0.windows.1
+

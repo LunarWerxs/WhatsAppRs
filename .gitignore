@@ -1,0 +1,8 @@
+/target
+/probe-report.jsonl
+/probe-profile
+/app-window.png
+*.log
+/tools/*.png
+/tools/wpn-copy.db*
+/bench-profiles

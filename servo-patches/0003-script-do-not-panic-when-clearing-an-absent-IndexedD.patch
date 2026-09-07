@@ -1,0 +1,41 @@
+From 6cc5d8fef695653cee23ba655183db4ad606e4cd Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 00:01:46 -0500
+Subject: [PATCH 3/4] script: do not panic when clearing an absent IndexedDB
+ upgrade transaction
+
+A backend error during an upgrade (for example a schema constraint failure on
+createIndex) can abort the transaction before it was recorded on the
+connection. clear_upgrade_transaction then hit an .expect() and took the whole
+script thread down, crashing the page. Treat a missing upgrade transaction as
+already cleared and log it.
+---
+ components/script/dom/indexeddb/idbdatabase.rs | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbdatabase.rs b/components/script/dom/indexeddb/idbdatabase.rs
+index b52e8d96e..ee9e89dbc 100644
+--- a/components/script/dom/indexeddb/idbdatabase.rs
++++ b/components/script/dom/indexeddb/idbdatabase.rs
+@@ -145,10 +145,14 @@ impl IDBDatabase {
+     }
+ 
+     pub(crate) fn clear_upgrade_transaction(&self, transaction: &IDBTransaction) {
+-        let current = self
+-            .upgrade_transaction
+-            .get()
+-            .expect("clear_upgrade_transaction called but no upgrade transaction is set");
++        // A backend error during an upgrade (for example a schema constraint failure
++        // on createIndex) can abort the transaction before it was recorded here, and
++        // an abort must never take the whole script thread down with it. Treat a
++        // missing upgrade transaction as already cleared.
++        let Some(current) = self.upgrade_transaction.get() else {
++            warn!("clear_upgrade_transaction called but no upgrade transaction is set");
++            return;
++        };
+ 
+         debug_assert!(
+             &*current == transaction,
+-- 
+2.52.0.windows.1
+
