@@ -388,7 +388,13 @@ version cloned every stored value into every synthesized record, including for `
 multiEntry index. Skipping the copy when the caller does not need values (commit `bb675ad84`)
 stops the climb.
 
-**It is still about 1.4 GB, and that is the open problem.** For comparison, the Chrome wrapper this
+Servo's own memory settings then took another 250 MB off. Compacting and incremental garbage
+collection are both off by default, so the JavaScript heap was never handed back; with those on
+plus one layout thread it settles at **1168 MB, flat**, and the chat list still renders correctly
+including pinned and archived rows. Those three are now set in `servo_view.rs`, so a plain launch
+gets them.
+
+**It is still about 1.2 GB, and that is the open problem.** For comparison, the Chrome wrapper this
 replaces measured 803 MB on the same account, and DECISIONS.md #10 records that even 500 MB was
 judged too much. Two candidates for the remainder, in order: index queries still materialise the
 entire object store as JavaScript values on every call, which is the design's known weakness and

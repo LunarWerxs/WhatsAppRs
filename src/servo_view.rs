@@ -456,6 +456,16 @@ impl App {
         // this the worker throws before registering its message handler, never
         // answers the page, and the UI waits on it forever: "Loading your chats".
         preferences.dom_weblocks_enabled = true;
+
+        // Memory. A synced WhatsApp account is a heavy page, and Servo's defaults
+        // never hand the JavaScript heap back. Measured on a real account, flat
+        // after four minutes either way: 1436 MB with the defaults, 1185 MB with
+        // these. Compacting and incremental collection do the work; one layout
+        // thread was already measured as safe (DECISIONS.md #10).
+        preferences.js_mem_gc_compacting_enabled = true;
+        preferences.js_mem_gc_incremental_enabled = true;
+        preferences.layout_threads = 1;
+
         preferences.user_agent = user_agent();
         let opts = Opts {
             config_dir: Some(self.data_dir.join("servo")),
