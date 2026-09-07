@@ -411,6 +411,41 @@ Still open after all this: **OPFS** is absent and cannot be shimmed cheaply, and
 breaking anything. `IDBCursor.update`/`delete` remain unimplemented, and index queries scan the
 whole object store, which will not scale to a large mailbox.
 
+## Why it feels slow, measured 2026-09-07
+
+The owner asked whether this is a cut-down WhatsApp. It is not: it is the same web.whatsapp.com any
+browser loads, and nothing is stripped. The slowness is the engine.
+
+**Rendering is properly GPU accelerated**, so this is not a software-rendering fallback:
+`webrender` reports `ANGLE (NVIDIA GeForce RTX 4070 Ti Direct3D11)` through OpenGL ES 3.0.
+
+**Frame timing on the real account** (`tools/jank-run.ps1`, six seconds of animation frames taken
+thirty seconds after the chat list appears):
+
+| configuration | fps | median frame | 95th percentile | worst |
+| --- | --- | --- | --- | --- |
+| compacting + incremental GC, 1 layout thread | 18.4 | 31.6 ms | 164 ms | 211 ms |
+| engine defaults + incremental GC | 38.1 | 16.4 ms | 42 ms | 348 ms |
+| 6 layout threads | 31.5 | 31.3 ms | 33 ms | 47 ms |
+| engine defaults | 31.2 | 31.4 ms | 46 ms | 46 ms |
+| engine defaults, repeat run | 8.5 | 85.2 ms | 278 ms | 324 ms |
+
+**Read that last row before drawing conclusions from the others.** The same configuration measured
+8.5 fps and 31.2 fps on two runs, so run-to-run variance is larger than most of the differences
+here. What survives the noise: the first row is genuinely bad, and it was a self-inflicted wound.
+Forcing compacting collection and a single layout thread, which had looked like a memory win, cost
+roughly half the frame rate and saved nothing; both overrides are reverted, and the code now says
+not to tune this without the probe.
+
+What does not survive: any claim that a particular pref makes it fast. It is slower than Chromium
+because Servo's layout and script are younger, and at 30 fps with occasional 300 ms stalls that is
+visible. Memory sits around 1.2 GB across runs, against 803 MB for the Chrome wrapper this replaces.
+
+**Index queries are not the cause of the lag**, though they will be eventually. Benchmarked over a
+3,000-record store with an index (`tools/perf-test.js`): one `index.getAll` returning 60 rows takes
+7 ms, ten `getAllKeys` take 48 ms. That is a full scan every time, so it grows with the store; at a
+mailbox ten times this size it becomes tens of milliseconds per lookup and worth fixing properly.
+
 ## Storage persistence on Servo, measured 2026-09-07
 
 Written in one run, read back in the next, with a clean shutdown between

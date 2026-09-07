@@ -1,0 +1,92 @@
+From f145689ab73bded96f10ffcfbb6e1cc7f7a3158d Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 16:41:44 -0500
+Subject: [PATCH] indexeddb: require a key for index get/getKey, and log failed
+ requests at the source
+
+get() and getKey() ask for a single record, so an undefined or null query is a
+DataError per spec; they were treating it as "the whole index" like getAll does.
+
+Also logs every IndexedDB request failure where it happens. A DOMException carries
+no JavaScript stack, so a page that swallows the rejection leaves nothing behind:
+a repeating DataError on web.whatsapp.com could not be attributed to anything
+until this existed, and it then proved the IndexedDB path was not the source.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ components/script/dom/indexeddb/idbindex.rs   | 23 +++++++++++++++----
+ components/script/dom/indexeddb/idbrequest.rs |  3 +++
+ 2 files changed, 21 insertions(+), 5 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 2441ac1a8..c2d7e8103 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -174,8 +174,16 @@ fn read_value(
+     record: &IndexedDBRecord,
+     answer: MutableHandleValue,
+ ) -> Result<(), Error> {
+-    let data = postcard::from_bytes(&record.value).map_err(|_| Error::Data(None))?;
+-    structuredclone::read(cx, global, data, answer).map(|_ports| ())
++    let data = postcard::from_bytes(&record.value).map_err(|_| {
++        warn!(
++            "indexeddb: index record value failed to decode ({} bytes)",
++            record.value.len()
++        );
++        Error::Data(None)
++    })?;
++    structuredclone::read(cx, global, data, answer)
++        .map(|_ports| ())
++        .inspect_err(|_| warn!("indexeddb: index record value failed structured deserialize"))
+ }
+ 
+ impl IDBIndex {
+@@ -213,8 +221,12 @@ impl IDBIndex {
+     ) -> Fallible<DomRoot<IDBRequest>> {
+         self.check_usable()?;
+ 
+-        // The range applies to this index's keys, not to the store's.
+-        let range = convert_value_to_key_range(cx, query, Some(false))?;
++        // The range applies to this index's keys, not to the store's. get() and
++        // getKey() ask for one record and so require a key; everything else treats
++        // an absent query as the whole index.
++        let null_disallowed = matches!(kind, IndexQueryKind::Get | IndexQueryKind::GetKey);
++        let range = convert_value_to_key_range(cx, query, Some(null_disallowed))
++            .inspect_err(|e| warn!("indexeddb: index query range rejected: {e:?}"))?;
+ 
+         let index_param = IndexQueryParam {
+             index: Trusted::new(self),
+@@ -250,7 +262,8 @@ impl IDBIndex {
+         key_only: bool,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+         self.check_usable()?;
+-        let range = convert_value_to_key_range(cx, query, Some(false))?;
++        let range = convert_value_to_key_range(cx, query, Some(false))
++            .inspect_err(|e| warn!("indexeddb: index cursor range rejected: {e:?}"))?;
+ 
+         let cursor = if key_only {
+             IDBCursor::new(
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 085b6dd8a..8cd68f983 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -351,6 +351,8 @@ impl RequestListener {
+ 
+     // https://www.w3.org/TR/IndexedDB-3/#async-execute-request
+     // Implements Step 5.4.2
++    /// Log every failed IndexedDB request at its source. A DOMException carries no
++    /// JavaScript stack, so a page that swallows the error leaves nothing to go on.
+     fn handle_async_request_error(
+         global: &GlobalScope,
+         cx: &mut JSContext,
+@@ -358,6 +360,7 @@ impl RequestListener {
+         error: Error,
+         request_id: u64,
+     ) {
++        warn!("indexeddb: request {request_id} failed: {error:?}");
+         let transaction = request
+             .transaction
+             .get()
+-- 
+2.52.0.windows.1
+
