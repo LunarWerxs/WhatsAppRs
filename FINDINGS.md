@@ -371,8 +371,29 @@ caused it, each hidden behind the last:
    iteration that left an index cursor's primary key undefined (`df26942dc`).
 
 With those, **the chat list renders**: real conversations, avatars, previews and unread counts
-(`chats-loaded.png`). One process, about 1.0 GB working set with a fully synced account, which is
-substantially more than the 442 MB measured on the logged-out screen and is worth its own look.
+(`chats-loaded.png`). One process.
+
+### Memory with a real account, and the leak that was in my own patch
+
+Measured on the same account, same launch, same intervals:
+
+| | 1 min | 2 min | 4 min | later |
+| --- | --- | --- | --- | --- |
+| first working build | 949 MB | 959 MB | 1643 MB | 2022 MB after ~45 min |
+| after the fix below | 1400 MB | 1433 MB | **1436 MB, flat** | |
+
+The growth was mine. An index query rebuilds its records from a full store scan, and my first
+version cloned every stored value into every synthesized record, including for `getAllKeys`,
+`count` and key-only cursors that never read a value, multiplied again by array length for a
+multiEntry index. Skipping the copy when the caller does not need values (commit `bb675ad84`)
+stops the climb.
+
+**It is still about 1.4 GB, and that is the open problem.** For comparison, the Chrome wrapper this
+replaces measured 803 MB on the same account, and DECISIONS.md #10 records that even 500 MB was
+judged too much. Two candidates for the remainder, in order: index queries still materialise the
+entire object store as JavaScript values on every call, which is the design's known weakness and
+the reason real index tables in the backend are the destination; and Servo's own footprint on a
+page this size. Neither has been measured apart yet.
 
 The instrument that made this tractable was forwarding the page's console and capturing unhandled
 rejections **with their message**, not just a stack. The first attempt logged only stacks and named

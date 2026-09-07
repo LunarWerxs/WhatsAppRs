@@ -1,0 +1,174 @@
+From bb675ad847834b1be88faa31b27c639ae0734c3f Mon Sep 17 00:00:00 2001
+From: L0garithmic <L0garithmic@users.noreply.github.com>
+Date: Mon, 7 Sep 2026 15:12:17 -0500
+Subject: [PATCH] indexeddb: do not copy stored values into index records that
+ never read them
+
+An index query rebuilds its records from a full scan of the object store, and it
+was cloning every stored value into every synthesized record, including for
+getAllKeys, getKey, count and key-only cursors, which never look at a value. A
+multiEntry index multiplied that by the number of array elements per record.
+
+Measured against a fully synced WhatsApp account, same launch, same intervals:
+before, the process went 949 MB at one minute to 1643 MB at four and kept
+climbing (2022 MB after roughly three quarters of an hour); after, it settles at
+about 1435 MB and stays flat. The growth was the copies.
+
+Index behaviour is unchanged: getAll, get, getAllKeys, count, a multiEntry
+lookup and an index cursor all return the same results as before.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ components/script/dom/indexeddb/idbcursor.rs  |  1 +
+ components/script/dom/indexeddb/idbindex.rs   | 37 +++++++++++++++----
+ components/script/dom/indexeddb/idbrequest.rs |  3 +-
+ 3 files changed, 32 insertions(+), 9 deletions(-)
+
+diff --git a/components/script/dom/indexeddb/idbcursor.rs b/components/script/dom/indexeddb/idbcursor.rs
+index 67e8f7ce9..c23f5c662 100644
+--- a/components/script/dom/indexeddb/idbcursor.rs
++++ b/components/script/dom/indexeddb/idbcursor.rs
+@@ -225,6 +225,7 @@ impl IDBCursor {
+                 range: self.range.clone(),
+                 count: None,
+                 kind: IndexQueryKind::Cursor,
++                needs_values: !self.key_only,
+             }),
+             ObjectStoreOrIndex::ObjectStore(_) => None,
+         };
+diff --git a/components/script/dom/indexeddb/idbindex.rs b/components/script/dom/indexeddb/idbindex.rs
+index 2ce285f33..2441ac1a8 100644
+--- a/components/script/dom/indexeddb/idbindex.rs
++++ b/components/script/dom/indexeddb/idbindex.rs
+@@ -115,6 +115,10 @@ pub(crate) struct IndexQueryParam {
+     pub(crate) count: Option<u32>,
+     #[no_trace]
+     pub(crate) kind: IndexQueryKind,
++    /// False when only keys are wanted. An index query rebuilds its records from
++    /// a full store scan, so copying every stored value into records nobody reads
++    /// is the difference between a cheap query and a very expensive one.
++    pub(crate) needs_values: bool,
+ }
+ 
+ impl IndexQueryParam {
+@@ -197,6 +201,7 @@ impl IDBIndex {
+     /// reading the object store and evaluating this index's key path over the
+     /// values. That is correct but linear in the size of the store, so it is a
+     /// stepping stone rather than the destination.
++    #[allow(clippy::too_many_arguments)]
+     fn query(
+         &self,
+         cx: &mut JSContext,
+@@ -204,6 +209,7 @@ impl IDBIndex {
+         kind: IndexQueryKind,
+         count: Option<u32>,
+         iteration_param: Option<IterationParam>,
++        needs_values: bool,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+         self.check_usable()?;
+ 
+@@ -215,6 +221,9 @@ impl IDBIndex {
+             range,
+             count,
+             kind,
++            // A cursor's need depends on its key-only flag, which the caller knows.
++            needs_values: matches!(kind, IndexQueryKind::Get | IndexQueryKind::GetAll) ||
++                (kind == IndexQueryKind::Cursor && needs_values),
+         };
+ 
+         // Scan the whole store; the reply handler narrows it down.
+@@ -274,8 +283,15 @@ impl IDBIndex {
+             count: None,
+         };
+ 
+-        self.query(cx, query, IndexQueryKind::Cursor, None, Some(iteration_param))
+-            .inspect(|request| cursor.set_request(request))
++        self.query(
++            cx,
++            query,
++            IndexQueryKind::Cursor,
++            None,
++            Some(iteration_param),
++            !key_only,
++        )
++        .inspect(|request| cursor.set_request(request))
+     }
+ 
+     /// Turn the store's records into this index's records: evaluate the key path
+@@ -288,6 +304,7 @@ impl IDBIndex {
+         cx: &mut JSContext,
+         global: &GlobalScope,
+         store_records: Vec<IndexedDBRecord>,
++        needs_values: bool,
+     ) -> Vec<IndexedDBRecord> {
+         let mut out: Vec<IndexedDBRecord> = Vec::new();
+ 
+@@ -331,7 +348,11 @@ impl IDBIndex {
+                 out.push(IndexedDBRecord {
+                     key,
+                     primary_key: record.primary_key.clone(),
+-                    value: record.value.clone(),
++                    value: if needs_values {
++                        record.value.clone()
++                    } else {
++                        Vec::new()
++                    },
+                 });
+             }
+         }
+@@ -458,12 +479,12 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+     /// <https://www.w3.org/TR/IndexedDB/#dom-idbindex-keypath>
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-get>
+     fn Get(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+-        self.query(cx, query, IndexQueryKind::Get, None, None)
++        self.query(cx, query, IndexQueryKind::Get, None, None, true)
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getkey>
+     fn GetKey(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+-        self.query(cx, query, IndexQueryKind::GetKey, None, None)
++        self.query(cx, query, IndexQueryKind::GetKey, None, None, false)
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getall>
+@@ -473,7 +494,7 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+         query: HandleValue,
+         count: Option<u32>,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+-        self.query(cx, query, IndexQueryKind::GetAll, count, None)
++        self.query(cx, query, IndexQueryKind::GetAll, count, None, true)
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-getallkeys>
+@@ -483,12 +504,12 @@ impl IDBIndexMethods<crate::DomTypeHolder> for IDBIndex {
+         query: HandleValue,
+         count: Option<u32>,
+     ) -> Fallible<DomRoot<IDBRequest>> {
+-        self.query(cx, query, IndexQueryKind::GetAllKeys, count, None)
++        self.query(cx, query, IndexQueryKind::GetAllKeys, count, None, false)
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-count>
+     fn Count(&self, cx: &mut JSContext, query: HandleValue) -> Fallible<DomRoot<IDBRequest>> {
+-        self.query(cx, query, IndexQueryKind::Count, None, None)
++        self.query(cx, query, IndexQueryKind::Count, None, None, false)
+     }
+ 
+     /// <https://w3c.github.io/IndexedDB/#dom-idbindex-opencursor>
+diff --git a/components/script/dom/indexeddb/idbrequest.rs b/components/script/dom/indexeddb/idbrequest.rs
+index 512ba58b8..085b6dd8a 100644
+--- a/components/script/dom/indexeddb/idbrequest.rs
++++ b/components/script/dom/indexeddb/idbrequest.rs
+@@ -223,7 +223,8 @@ impl RequestListener {
+                     let records = match self.index_param.as_ref() {
+                         Some(index_param) => {
+                             let index = index_param.index.root();
+-                            let mut records = index.records_for(cx, &global, records);
++                            let mut records =
++                                index.records_for(cx, &global, records, index_param.needs_values);
+                             records.retain(|record| index_param.range.contains(&record.key));
+                             if index_param.kind != IndexQueryKind::Cursor {
+                                 if let Err(e) =
+-- 
+2.52.0.windows.1
+
