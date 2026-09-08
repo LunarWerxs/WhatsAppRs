@@ -2,174 +2,65 @@
 name = "whatsapp-rs"
 version = "0.1.0"
 edition = "2021"
-description = "WhatsApp Web as a small native tray app"
+description = "WhatsApp Web as a small native tray app, on a Chromium we ship"
 
 [[bin]]
 name = "whatsapp"
 path = "src/main.rs"
 
-# The capability probe that established what works on each engine. Kept so the
-# findings stay reproducible rather than being a claim in a document.
-[[bin]]
-name = "probe"
-path = "src/bin/probe.rs"
-
-# Memory bench. Sweeps Chromium switches and WebView2 memory levels to find the
-# real floor, rather than asserting one.
-[[bin]]
-name = "bench"
-path = "src/bin/bench.rs"
-
-# Deliberately dep-light. No image crate (icons are pre-converted to raw RGBA and
-# embedded), no serde (the geometry file is five key=value lines), no dirs crate
-# (about fifteen lines of std). Versions live-checked on crates.io 2026-09-06.
+# Deliberately dep-light. No image crate (icons are pre-converted to raw RGBA and embedded),
+# no serde (the geometry file is five key=value lines, and the one JSON payload that crosses
+# a boundary is two fields parsed by hand), no dirs crate (about fifteen lines of std).
+#
+# What used to be here and is gone with the code that needed it: wry and webkit2gtk (the OS
+# webview), servo + winit + euclid + keyboard-types + rustls (the embedded Servo), and
+# whatsapp-rust + tokio + qrcode (the native-protocol client). All four were built, measured
+# against this one, and deleted; FINDINGS.md keeps the numbers.
 [dependencies]
-# Safe mode: the OS webview and a tray icon.
-wry = "0.56.1"
+# The engine: Chromium, bundled, embedded as a child of our own window. The `cef` crate tracks
+# Chromium 152, the same major the OS webview on this machine runs, so the comparison that
+# chose it was engine-to-engine and not version-to-version. `sandbox` is off because CEF's
+# Windows sandbox needs a second bootstrap executable, which would make this two binaries.
+cef = { version = "152.0.0", default-features = false, features = ["resources"] }
+
+# Our window, our tray, our menu.
 tao = "0.37.0"
 tray-icon = "0.24.2"
 muda = "0.19.3"
 
-# Light mode: WhatsApp's protocol with no browser at all.
-# `simd` is in whatsapp-rust's default features and is the ONLY thing in its tree
-# needing a nightly compiler (wacore-binary gates `feature(portable_simd)` on it),
-# so the rest of that default set is restored here by name and this builds on stable.
-whatsapp-rust = { version = "0.7", default-features = false, features = [
-    "sqlite-storage",
-    "tokio-transport",
-    "tokio-runtime",
-    "ureq-client",
-    "tokio-native",
-    "signal",
-] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "time"] }
-qrcode = "0.14"
-
-# Light mode raises its own notifications; safe mode lets the webview do it.
+# The host draws the toasts, because the engine will not. See src/notify.rs.
 notify-rust = "4.18"
 
-# Safe mode on Servo (DECISIONS.md #8): our own build of the engine, the same on
-# every OS, from the sibling checkout with the Cache Storage patches. Opt-in
-# feature because the build is heavy; tools/build-servo.ps1 drives it.
-servo = { path = "../servo/components/servo", optional = true, default-features = false, features = [
-    "bundled",
-    "clipboard",
-    "js_jit",
-    "webcrypto",
-] }
-winit = { version = "0.30.13", optional = true }
-euclid = { version = "0.22", optional = true }
-url = { version = "2.5", optional = true }
-keyboard-types = { version = "0.8.3", optional = true }
-# Servo's TLS (rustls) leaves the crypto provider to the embedder; without one the
-# network thread panics on its first request. Same choice as servoshell.
-rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
-
-# Safe mode on a bundled Chromium (DECISIONS.md #15). The Chromium Embedded Framework
-# through the tauri-apps `cef` crate, which tracks Chromium 152 - the same major the OS
-# webview on this machine runs, so the comparison is engine-to-engine and not
-# version-to-version. Opt-in because the runtime is a 171 MB download and the wrapper
-# needs cmake + ninja + MSVC. `sandbox` is off: CEF's Windows sandbox needs a separate
-# bootstrap executable, which would make this two binaries instead of one.
-cef = { version = "152.0.0", default-features = false, features = ["resources"], optional = true }
-
-[features]
-servo = ["dep:servo", "dep:winit", "dep:euclid", "dep:url", "dep:keyboard-types", "dep:rustls"]
-cef = ["dep:cef"]
-# Safe mode on a bundled Firefox. No extra crates: Gecko cannot be embedded, so this is
-# process management and window adoption, both of which the `windows` crate already covers.
-firefox = []
-
-# Servo's SQLite wrapper and light mode's session store must link the same native
-# SQLite. The fork pins rusqlite 0.39 for that; its query-builder adapter has no
-# release on 0.39 yet, so the fork vendors a one-line-changed copy, patched here too.
-[patch.crates-io]
-sea-query-rusqlite = { path = "../servo/third_party/sea-query-rusqlite" }
-
-# Windows-only: raw ICoreWebView2, needed to grant the Notifications permission
-# that WebView2 otherwise auto-denies, and to set the AppUserModelID that Windows
-# requires before it will render a toast at all.
-# windows MUST be 0.61 to match webview2-com 0.38.2's tree; 0.62 pulls a second
-# windows-strings and PWSTR silently becomes a different type.
-[target.'cfg(target_os = "windows")'.dependencies]
-webview2-com = "0.38.2"
-windows-core = "0.61"
-# Servo on Windows renders through ANGLE (libEGL.dll, libGLESv2.dll beside the exe),
-# never WGL; servoshell sets the same.
-servo = { path = "../servo/components/servo", optional = true, default-features = false, features = ["no-wgl"] }
-
+# Windows-only: the AppUserModelID and the Start Menu shortcut that carries it, without which
+# Windows silently drops every toast, and the SetWindowPos that keeps the browser's child
+# window the size of ours.
 [target.'cfg(target_os = "windows")'.dependencies.windows]
 version = "0.61"
 features = [
   "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  # The Start Menu shortcut (shortcut.rs): IShellLinkW + IPersistFile + IPropertyStore, a
+  # VT_LPWSTR PROPVARIANT, and PKEY_AppUserModel_ID.
   "Win32_System_Com",
   "Win32_UI_Shell",
-  "Win32_UI_WindowsAndMessaging",
-  # TaskDialogIndirect: the native two-option picker shown on first launch.
-  "Win32_UI_Controls",
-  # The Start Menu shortcut carrying the AppUserModelID (shortcut.rs): IShellLinkW
-  # + IPersistFile + IPropertyStore, a VT_LPWSTR PROPVARIANT, and PKEY_AppUserModel_ID.
   "Win32_UI_Shell_PropertiesSystem",
   "Win32_System_Com_StructuredStorage",
   "Win32_System_Variant",
-  "Win32_Storage_EnhancedStorage",
   "Win32_Storage_FileSystem",
-  # Light mode's chat window (chat_ui.rs): plain Win32 controls and GDI for the QR.
-  "Win32_Graphics_Gdi",
-  "Win32_System_LibraryLoader",
-  "Win32_UI_Input_KeyboardAndMouse",
-  "Win32_UI_HiDpi",
-  # Local time for message stamps; the bundled chrono has no clock feature.
-  "Win32_System_Time",
-  # WhatsApp's look (ui_theme.rs): GDI+ for anti-aliased shapes, DWM for the dark
-  # title bar, the registry for Windows' light/dark setting.
-  "Win32_Graphics_GdiPlus",
-  "Win32_Graphics_Dwm",
-  "Win32_System_Registry",
-  # Firefox mode (firefox_view.rs): adopting another process's window, identifying which
-  # process owns it, and a job object so the browser cannot outlive the host.
-  "Win32_System_JobObjects",
-  "Win32_System_Threading",
-  # CreateJobObjectW takes a SECURITY_ATTRIBUTES, so the whole call is gated on this.
-  "Win32_Security",
+  # PKEY_AppUserModel_ID lives in EnhancedStorage, of all places.
+  "Win32_Storage_EnhancedStorage",
 ]
 
-# Embeds the manifest that makes TaskDialogIndirect resolvable (Common Controls
-# v6). Without it the exe dies at load with STATUS_ENTRYPOINT_NOT_FOUND. See build.rs.
+# Embeds the Windows manifest: common controls v6 and per-monitor DPI awareness. See build.rs.
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-manifest = "1.5.0"
 
-# Linux-only: raw webkit2gtk::WebView. v2_16 gates
-# initialize_notification_permissions, which is the only thing that actually
-# grants notifications on WebKitGTK. The permission-request signal never fires.
-[target.'cfg(target_os = "linux")'.dependencies]
-webkit2gtk = { version = "2.0.2", features = ["v2_16"] }
-
 [profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
-
-# The bundled-Chromium build. Kept out of `release` so it never fights the other builds
-# for the target lock, and out of whole-program LTO, which buys nothing across an FFI
-# boundary into a 272 MB prebuilt DLL and costs minutes.
-[profile.cefapp]
-inherits = "release"
+# opt-level "z" and whole-program LTO buy nothing here and cost minutes: almost all the code in
+# this app is behind an FFI boundary in a 272 MB prebuilt DLL. The binary is ~17 MB either way,
+# against 325 MB of engine beside it.
 opt-level = 2
 lto = false
 codegen-units = 16
 panic = "abort"
-strip = true
-
-# The Servo build: an engine's worth of code, so no whole-program LTO and no
-# single codegen unit (hours and tens of GB otherwise), and speed over size, as
-# Servo's own release profile chooses. Output lands in target/servo/.
-[profile.servo]
-inherits = "release"
-opt-level = 3
-lto = false
-codegen-units = 16
-panic = "unwind"
 strip = true

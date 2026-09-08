@@ -1,27 +1,23 @@
 <#
-Close-to-tray, restore, and clean quit, on either bundled-engine build.
+Close-to-tray, restore, and clean quit.
 
-These are the behaviours the whole design exists for, and both new engines put a foreign
-window inside ours, so neither inherits them for free:
+These are the behaviours the whole app exists for, and the engine's browser is a child window
+of ours rather than something we drew, so none of them is inherited for free. Hiding a parent
+hides its children on Windows, so close-to-tray *should* just work - but "should" is how the
+last three silent failures in this project started, so it is measured.
 
-  * the Chromium build has CEF's child window in ours,
-  * the Firefox build has another PROCESS's window in ours.
+Writing this test is what found that `--quit` was being silently ignored, which meant every
+restart ended in a kill, which skips Chromium's cookie flush and loses the WhatsApp login.
 
-Hiding a parent hides its children on Windows, so close-to-tray should just work - but
-"should" is how the last three silent failures in this project started, so it is measured.
-
-  .\tray-test.ps1 -Engine cef
-  .\tray-test.ps1 -Engine firefox
+  .\tray-test.ps1
 #>
 param(
-    [Parameter(Mandatory)][ValidateSet('cef', 'firefox', 'webview2')][string]$Engine,
     [int]$Wait = 40,
-    [string]$Exe,
+    [string]$Exe = (Join-Path (Split-Path $PSScriptRoot) 'target\release\whatsapp.exe'),
     [int]$InstancePort = 47971
 )
 $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\pagescript.ps1"
-Add-Type -AssemblyName System.Windows.Forms
 Add-Type @'
 using System;
 using System.Text;
@@ -50,20 +46,16 @@ public static class TrayT {
 }
 '@
 
-if (-not $Exe) {
-    $Exe = if ($Engine -eq 'cef') { 'D:\ct\cefapp\whatsapp.exe' } else { 'D:\NEWProjects\WhatsAppRs\target\release\whatsapp.exe' }
-}
-$dataDir = "$env:LOCALAPPDATA\WhatsAppRs-tray-$Engine"
+if (-not (Test-Path $Exe)) { throw "no build at $Exe - run tools\build.ps1" }
+$dataDir = "$env:LOCALAPPDATA\WhatsAppRs-tray"
 New-Item -ItemType Directory -Force $dataDir | Out-Null
-Set-Content -Path (Join-Path $dataDir 'mode.txt') -Value 'safe' -NoNewline
 $env:WHATSAPP_RS_DATA_DIR      = $dataDir
 $env:WHATSAPP_RS_INSTANCE_PORT = "$InstancePort"
-$env:WHATSAPP_RS_ENGINE        = $Engine
 Remove-Item Env:WHATSAPP_RS_DEBUG_PORT -ErrorAction SilentlyContinue
 
 Wait-ForExit | Out-Null
 $p = Start-Process -FilePath $Exe -ArgumentList '--safe' -WorkingDirectory (Split-Path $Exe) -PassThru `
-        -RedirectStandardOutput "$PSScriptRoot\tray-$Engine.out" -RedirectStandardError "$PSScriptRoot\tray-$Engine.err"
+        -RedirectStandardOutput "$PSScriptRoot\tray.out" -RedirectStandardError "$PSScriptRoot\tray.err"
 Start-Sleep -Seconds $Wait
 if ($p.HasExited) { "FAIL: exited early with $($p.ExitCode)"; exit 2 }
 
@@ -88,16 +80,10 @@ $hwnd2 = [TrayT]::Top([uint32]$p.Id)
 $restored = ($hwnd2 -ne [IntPtr]::Zero) -and [TrayT]::Visible($hwnd2)
 "restore  : second launch exited=$($second.HasExited)  first window back=$restored  -> $(if ($second.HasExited -and $restored) { 'PASS' } else { 'FAIL' })"
 
-# 3. A clean quit, which is what keeps the WhatsApp login: both engines flush on shutdown.
+# 3. A clean quit, which is what keeps the WhatsApp login.
 Request-Quit -Exe $Exe
 $deadline = (Get-Date).AddSeconds(20)
 while ((Get-Date) -lt $deadline -and -not $p.HasExited) { Start-Sleep -Milliseconds 500; $p.Refresh() }
 "quit     : process exited=$($p.HasExited)  -> $(if ($p.HasExited) { 'PASS' } else { 'FAIL - --quit was ignored' })"
-
-if ($Engine -eq 'firefox') {
-    Start-Sleep -Seconds 3
-    $orphans = @(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -like '*\firefox\firefox.exe' })
-    "orphans  : $($orphans.Count) firefox processes left  -> $(if ($orphans.Count -eq 0) { 'PASS' } else { 'FAIL - the job object did not take them' })"
-}
 
 Wait-ForExit | Out-Null

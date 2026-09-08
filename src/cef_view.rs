@@ -429,9 +429,34 @@ wrap_app! {
                 "no-pings",
                 "no-default-browser-check",
                 "no-first-run",
+                // The process trim, measured 2026-09-07 across five configurations:
+                // 7 processes and 550 MB stock, 5 processes and 501 MB with these three.
+                //
+                // `in-process-gpu` and NOT `disable-gpu`: disabling the GPU also saved
+                // memory, but it drops Chromium onto a software rasteriser, which is the
+                // shape of the mistake the Servo round made - a memory "win" that cost the
+                // frame rate. In-process GPU keeps the Direct3D11 path and merely stops it
+                // being a separate process; `tools/gfx-probe.js` confirms the real adapter
+                // is still in use afterwards.
+                //
+                // Deliberately NOT here: `--single-process`, which measures 352 MB in one
+                // process. The owner ruled it out (2026-09-07) and he is right to: it is
+                // unsupported by Chromium and a renderer crash takes the whole app down
+                // instead of showing an error page.
+                //
+                // Also not here: `--enable-low-end-device-mode`. It was 4 MB better than
+                // this set and doubled the time to first paint, and it shrinks tile and
+                // cache budgets in ways that would show up on a long chat list rather than
+                // on the login page this was measured against.
+                "in-process-gpu",
+                "process-per-site",
             ] {
                 cmd.append_switch(Some(&CefString::from(switch)));
             }
+            cmd.append_switch_with_value(
+                Some(&CefString::from("renderer-process-limit")),
+                Some(&CefString::from("1")),
+            );
             cmd.append_switch_with_value(
                 Some(&CefString::from("disable-features")),
                 Some(&CefString::from(concat!(

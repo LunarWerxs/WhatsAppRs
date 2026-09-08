@@ -898,3 +898,118 @@ ignored by three of the four engine backends. They called a `poll_show_request` 
 returned only the "show" half of a queued request and **discarded a queued quit**, so every
 restart ended in a process kill - which skips the session flush and is exactly how a WhatsApp
 login gets lost. The helper is deleted; all four backends now read the whole request.
+
+---
+
+# One engine, everything else deleted, 2026-09-07
+
+The owner picked bundled Chromium, ruled out `--single-process`, and asked for everything else
+to go. This section is what shipped and the two questions he asked while it was being built.
+
+## The shipped configuration, and what it cost to find
+
+Five multi-process configurations, two runs each, logged out, sampled 45 s after the page
+reported itself ready:
+
+| switches added | processes | working set | private | ready |
+| --- | --- | --- | --- | --- |
+| none (the feature-disabling set only) | 7 | 550 MB | 380 MB | 3.3 s |
+| `in-process-gpu` | 6 | 518 MB | 361 MB | 3.3 s |
+| **+ `renderer-process-limit=1` + `process-per-site`** | **5** | **501 MB** | 366 MB | 3.3 s |
+| + `enable-low-end-device-mode` | 5 | 497 MB | 361 MB | 6.6 s |
+| + network service in-process | 5 | 507 MB | 373 MB | 3.3 s |
+
+The third row ships. The fourth was 4 MB better and doubled time-to-first-paint, and it shrinks
+tile and cache budgets in ways that would show on a long chat list rather than on the login page
+it was measured against, so it is not worth 4 MB.
+
+**`in-process-gpu`, deliberately not `disable-gpu`.** Disabling the GPU also saved memory - it
+was the best private-bytes result in the earlier sweep - and it drops Chromium onto a software
+rasteriser. That is the exact shape of the Servo round's mistake: a memory "win" that costs the
+frame rate. In-process GPU keeps the Direct3D11 path and only stops it being a separate process.
+Verified after the change, from the page itself:
+`ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Ti (0x00002782) Direct3D11 vs_5_0 ps_5_0)`, and every
+capability WhatsApp needs still present including a controlling service worker, Web Locks, OPFS
+and WebRTC.
+
+`--single-process` measured 352 MB in one process and is **not** in the build. It is the biggest
+single lever available and the owner declined it: Chromium does not support the mode, and a
+renderer crash there takes the whole app down instead of showing an error page. About 150 MB
+for that isolation is the trade he chose.
+
+## What was deleted
+
+Twelve source files, sixteen instruments, and a 345 MB bundled Firefox runtime: the OS webview
+backend, the embedded Servo backend, the bundled Firefox backend, the native-protocol light mode
+and its four hand-drawn UI modules, the first-run picker, and two probe binaries. The release
+binary went from **17 MB to 0.9 MB**, because `wry`, `servo`, `winit`, `rustls`, `whatsapp-rust`,
+`tokio` and `qrcode` went with the code that used them. Eight source files remain.
+
+Everything is in `git log`. The light-mode client in particular is one `git checkout` away if
+the ban risk is ever reconsidered.
+
+## "Is the real app lighter?" - no, and it is Chromium too
+
+Meta's WhatsApp for Windows is installed on this machine, so it could simply be measured. It is
+a **WebView2 shell**: `WebView2Loader.dll` and `Microsoft.Web.WebView2.Core.dll` sit in its
+install directory, and its renderers are `msedgewebview2.exe`. Same engine class as ours, using
+Edge's copy of it.
+
+| | processes | working set | private | on disk | profile |
+| --- | --- | --- | --- | --- | --- |
+| Meta's app, **logged in, real account** | 8 | **1110 MB** | 801 MB | 386 MB | 254 MB |
+| this app, logged out | 5 | 501 MB | 366 MB | 325 MB | 36 MB |
+
+Not a like-for-like comparison - theirs is carrying a synced mailbox and ours is not - but it is
+the toughest version of the comparison for us and Meta's app still uses more than twice the
+memory. It is also the thing that would otherwise be running on this machine.
+
+Two measurement traps that took three attempts, because both produced a confident wrong number:
+matching its processes by install path alone found **one** process at 256 MB and missed the
+browser entirely, since WebView2's renderers live in the Edge runtime folder; adding a
+parent-child tree walk then swept in `svchost`, `fontdrvhost` and most of the machine, because a
+re-parented process leaves an orphan whose parent id resolves to something that owns everything.
+`tools/official-app.ps1` now matches exactly: its own executables by path, plus the
+`msedgewebview2.exe` processes handed a user-data-dir inside its package.
+
+## "Can we rip apart the APK and run what is inside?" - that is light mode, and it is retired
+
+No, and the reason is worth writing down because the idea will come back.
+
+An APK is Android bytecode (DEX) plus native `.so` libraries, written against the Android
+framework. There is no portable program inside it; "running what is inside" means running
+Android, and Microsoft's Windows Subsystem for Android reached end of support on 2025-03-05 and
+is gone from the Store. What is left - BlueStacks, LDPlayer, Google Play Games - is a full
+Android virtual machine, which is strictly more than a browser tab, and none of it is installed
+here. Separately and fatally: the WhatsApp Android app registers a phone number as a **primary**
+device, so running it would log the real phone out. Web and Desktop are *linked* devices, which
+is why they can coexist with a phone at all.
+
+The part of the APK actually worth extracting is the protocol, and other people already
+extracted it (whatsmeow, Baileys, whatsapp-rust). **That library is exactly what light mode
+was**: about 20 MB, one process, built and measured in this repo, and retired in DECISIONS.md
+#14 because pulling the protocol out of their app is the clause their Terms forbid verbatim -
+"reverse engineer, alter, modify, create derivative works from, decompile, or extract code from
+our Services" - and accounts using such clients have been permanently banned.
+
+So the choice has always been two things with nothing in between: **speak their protocol at
+20 MB with a permanent ban risk, or render their website at 350-560 MB with none.** Meta ships
+the second at 1110 MB. This app ships it at 501 MB.
+
+## The shipped build, three runs
+
+Final measurement of what actually ships, same protocol as everything else: fresh profile,
+sampled 60 s and 240 s after the page reports itself ready.
+
+| | processes | ws @60s | private @60s | ws @240s | private @240s | CPU @240s | ready | spread |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| whatsapp-rs, shipped | 5 | 483 MB | 355 MB | **490 MB** | 347 MB | 11 s | 3.3 s | 483-504 |
+
+**310.2 MB in 11 files** for the trimmed shippable bundle - 15 MB less than the earlier
+measurement purely because the binary went from 17 MB to 0.9 MB when the deleted engines took
+their dependencies with them. The bundle was launched and every capability re-checked from it:
+service worker registered and controlling, IndexedDB, Web Locks, OPFS, WebRTC, WebGL, notification
+permission granted.
+
+Against what it replaces, all by the same method: **490 MB against Meta's 1110 MB and plain
+Chrome's 800 MB**, in 5 processes against 8 and 10.

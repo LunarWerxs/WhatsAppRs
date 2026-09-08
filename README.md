@@ -1,183 +1,101 @@
 # whatsapp-rs
 
-WhatsApp Web as a small native tray app. Windows, Linux, and macOS-shaped but untested.
-Written from scratch. No forked code.
+WhatsApp Web as a small native tray app, on a Chromium we ship. Written from scratch, no forked
+code. Windows today; the design is portable but nothing else has been built.
 
-> **Current direction, 2026-09-07.** Safe mode now has four engine backends, chosen at build time,
-> and two of them are new candidates being compared head to head (DECISIONS.md #15):
->
-> | engine | how to build it | the page reports itself as |
-> | --- | --- | --- |
-> | **bundled Chromium** (`src/cef_view.rs`) | `tools/build-cef.ps1`, output `D:\ct\cefapp` | Chrome 152 |
-> | **bundled Firefox** (`src/firefox_view.rs`) | `cargo build --release --features firefox` | Firefox 155 |
-> | the OS webview (`src/webview.rs`) | `cargo build --release` | Microsoft Edge (rejected) |
-> | Servo (`src/servo_view.rs`) | retired, DECISIONS.md #13 | Firefox 143 |
->
-> `WHATSAPP_RS_ENGINE=cef|firefox|webview2` picks one at run time within a build that contains it.
-> The comparison, and the two findings that decide it, are the last section of FINDINGS.md.
-> Light mode is retired (DECISIONS.md #14); its code is still here and unmaintained.
+**0.9 MB binary, 310 MB of bundled engine beside it, 5 processes, 490 MB of RAM.** Most of that
+is WhatsApp's own JavaScript, not this wrapper. See "Why it is 500 MB" below, because that is the
+question everybody asks and it has a measured answer.
 
-**786 KB release binary.** The rendering engine is the one your OS already ships, so nothing is
-bundled: WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS.
+## Measured, 2026-09-07
 
-## The two bundled engines, measured 2026-09-07
+Same instruments for every row: whole process tree, working set and private bytes, sampled after
+the page reports itself ready. Method and the full sweep in FINDINGS.md.
 
-Logged out, same instruments, whole process tree, sampled after the page reported itself ready.
-Full method and every configuration in FINDINGS.md; the short version:
+| | processes | RAM | private | on disk | profile |
+| --- | --- | --- | --- | --- | --- |
+| **this app** (logged out) | **5** | **490 MB** | 347 MB | 310 MB | 36 MB |
+| Meta's WhatsApp for Windows (logged in) | 8 | 1110 MB | 801 MB | 386 MB | 254 MB |
+| plain Chrome `--app` (what the old C# wrapper drove) | 10 | 800 MB | 571 MB | installed | 102 MB |
+| the old C# wrapper, measured 2026-09-06 | 10 | 803 MB | - | installed | 343 MB |
 
-| | processes | RAM (working set) | RAM (private) | CPU to load | engine on disk | user agent says |
-| --- | --- | --- | --- | --- | --- | --- |
-| **bundled Chromium, one process** | **1** | **352 MB** | 294 MB | **6 s** | 325 MB | Chrome |
-| bundled Chromium, default | 7 | 548 MB | 385 MB | 7 s | 325 MB | Chrome |
-| **bundled Firefox, best of six configs** | 10 | **1112 MB** | 1030 MB | 41 s | 344 MB | Firefox |
-| *(control)* the OS webview, as shipped today | 3 | 376 MB | 201 MB | 12 s | nothing | Microsoft Edge |
-| *(control)* plain Chrome, what the C# app drives | 10 | 800 MB | 571 MB | 12 s | already installed | Chrome |
+The last two rows agree to within 3 MB, measured a day apart by different scripts, which is the
+check that the method is sound rather than flattering.
 
-The last row is the check on the method, not a proposal: it reproduces the 803 MB the C# wrapper
-measured on a different day with a different script, so the numbers beside it can be trusted.
+**Meta's own app is a WebView2 shell** - `WebView2Loader.dll` sits in its install directory - so
+it is Chromium too, and it uses more than twice the memory of this one.
 
-The last column is what the page reports as its browser, measured; what the **phone's** linked-device
-list shows is derived from that but has not been confirmed on a phone yet, because nobody has linked
-these builds. `tools\login.ps1` is there for it.
+## Why it is 500 MB, and why that is not fixable here
 
-**Chromium wins on everything measurable and loses on one thing that is not.** The official CEF
-binaries carry no H.264, and there is no switch for it - so WhatsApp video calls that insist on
-H.264 and, already documented by other CEF users, **uploading an MP4 to WhatsApp**, are the price.
-Firefox has H.264 and also raises real Windows toasts by itself, where Chromium needs the host to
-draw them. See FINDINGS.md, "Bundled Chromium vs bundled Firefox".
+WhatsApp Web's own JavaScript heap is 61-72 MB used and 97-103 MB allocated **on a logged-out
+login screen**, from ~25 MB of decoded script. Rendering that needs a modern browser engine, and
+in 2026 the only engines that render `web.whatsapp.com` are a Chromium or a WebKit. Four
+alternatives were built and measured before this one was chosen:
 
-## Measured against the C# Chrome wrapper it replaces (the OS-webview build)
+| | processes | RAM | verdict |
+| --- | --- | --- | --- |
+| the OS webview (Edge's engine, bundles nothing) | 3 | 372 MB | rejected: the phone lists it as "Microsoft Edge" |
+| **bundled Chromium, this app** | 5 | 490 MB | shipped |
+| bundled Firefox, driven as a separate process | 10 | 1115 MB | rejected: 15x the CPU, cannot be embedded |
+| embedded Servo | 1 | ~1200 MB | rejected: ~30 fps, no WebRTC ever |
+| native protocol client, no browser at all | 1 | **20 MB** | rejected: permanent ban risk |
 
-| | This app | Old C# wrapper |
-| --- | --- | --- |
-| Binary | **786 KB** | 96 KB |
-| RAM, idle on the login page | **375 MB** | 803 MB |
-| Processes | **3** (1 ours + 2 engine) | 10 |
-| Data directory, fresh | **31 MB** | 103 MB |
-| Data directory, projected with full history | **about 65 MB** | 343 MB |
-| Requires Chrome installed | no | yes |
-
-Those RAM and process numbers are after tuning. Stock configuration was 633 MB across 8 processes;
-`--single-process` plus a set of feature-disabling switches took it to 375 MB across 3, verified not
-to break the service worker or notifications. Set `WHATSAPP_RS_MULTIPROCESS=1` to fall back to the
-stock multi-process engine if single-process ever misbehaves.
-
-**The remaining 352 MB is WhatsApp's own application, not this wrapper.** Measured: its JavaScript
-heap alone is 68.7 MB used / 97.1 MB allocated, from 20 scripts totalling 25.3 MB decoded, on a
-logged-out login screen with 382 DOM nodes. No engine choice avoids that. Our Rust process is 23 MB
-of the total.
-
-The profile shrinks because a WebView2 profile creates none of Chrome's browser-only baggage.
-Verified absent: Safe Browsing lists, optimization_guide_model_store, component_crx_cache,
-WasmTtsEngine, OnDeviceHeadSuggestModel, ActorSafetyLists.
-
-Honest framing: the engine is Chromium on Windows either way. The saving is our binary and our
-profile, not the renderer. See FINDINGS.md.
+That last row is the only genuinely light option and it is the one nobody can use: the protocol
+is known only from reverse-engineering WhatsApp's apps, which their Terms forbid verbatim, and
+accounts have been permanently banned for it. The choice is 20 MB with a ban risk or ~490 MB
+without one. There is nothing in between, and Meta ships the same thing at 1110 MB.
 
 ## What works, verified by running it
 
-- **Loads WhatsApp Web** to the QR login screen, on Windows and on Linux/WebKitGTK 2.50.6. No
-  user-agent spoof needed on either.
-- **Notifications, as real Windows toasts.** Both engines deny the permission by default and each
-  needs a different host-side fix (`src/notify.rs`). On Windows that is not enough: WebView2 never
-  hands a web notification to Windows on its own (measured: the page's `onshow` fired, Windows'
-  notification database recorded nothing). The app now handles `NotificationReceived` itself and
-  raises the toast, and writes the Start Menu shortcut carrying the AppUserModelID that Windows
-  requires (`src/shortcut.rs`). Verified 2026-09-07 by screenshot: a toast from this app, on screen.
-  See `tools/README.md` for the instrument that proves it.
-- **Light mode has a chat window in WhatsApp's own shape** (`src/chat_ui.rs` and the `ui_*.rs`
-  modules): WhatsApp Web's layout and palette, light and dark following the Windows setting,
-  drawn by the app with GDI and GDI+. Pairing QR in the window, avatars, chat rows with preview,
-  time and unread badge, search, chat header, date pills, bubbles, composer with Enter to send,
-  history and contact names imported from the phone, messages kept between runs, close-to-tray.
-  Verified 2026-09-07 with `tools/light-drive.ps1` in both themes: a click on a chat, a typed
-  message, and the reply, at a 20 MB working set. `whatsapp.exe --light-demo` shows it with
-  sample chats and no network; `WHATSAPP_RS_THEME=light|dark` forces a theme.
-- **Close to tray.** Verified: the window hides and the process survives, for both the X button and
-  Alt+F4.
-- **Single instance.** Verified: a second launch exits on its own and raises the first.
-- **Window geometry persists**, and the file is only written when it actually changes. Verified: six
-  ticks with an unmoved window produced zero writes.
+- **WhatsApp Web**, in our own window, reporting as Chrome 152.
+- **Real Windows toasts**, headed "WhatsApp Rs", confirmed against Windows' own notification
+  database and by screenshot. CEF displays no web notifications at all, so the app injects a
+  shim that forwards them and raises the toast itself under a registered AppUserModelID.
+- **Voice and video calls** have everything they need: WebRTC gathers ICE candidates, the
+  microphone opens with its real device name, Opus is present. **H.264 is not** - see the gap
+  below.
+- **Close to tray, restore, single instance, clean quit**, all four PASS in `tools/tray-test.ps1`.
+  `--quit` is the only correct way to stop it: Chromium flushes cookies on a clean shutdown and a
+  kill loses the login.
+- **Hardware accelerated**: the page reports `ANGLE (NVIDIA GeForce RTX 4070 Ti, Direct3D11)`.
+- **Window geometry persists** and is only written when it changes.
 
-## What does not work
+## The one real gap
 
-- **macOS is unbuilt and untested.** wry's WKWebView backend does not implement the notifications
-  permission at all (see wry's own `src/permissions.rs`), so Mac needs a hand-written native bridge.
-  Everything else should port. No Mac was available.
-- **No voice or video calls on Linux.** Most distributions build WebKitGTK without WebRTC. Measured
-  here (`hasWebRTC: false`) and independently confirmed by other projects. Linux is
-  messaging-complete, calls-absent, by decision.
-- **No OPFS on Linux.** Harmless today because WhatsApp stores in IndexedDB, but a future-breakage risk.
-- **No tray icon on stock GNOME Wayland** without a user-installed extension. GNOME removed legacy
-  tray support.
-- **Service-worker notifications on Windows.** WebView2 raises `NotificationReceived` for the
-  page's `new Notification()` and never for a service worker's `showNotification()`; measured
-  under both the single-process flags and the multi-process fallback, no toast and no database row
-  either way. WhatsApp Web's loaded bundle uses `new Notification(` (that path is bridged) and has a
-  single `showNotification` reference, so a background alert sent that way would be lost.
+**No H.264.** The official CEF binaries are built without proprietary codecs and no switch
+enables them. Measured: this build offers VP8, VP9 and AV1 and no H264. That costs a video call
+that will not fall back to VP8, and it costs uploading an MP4 to WhatsApp (the page decodes it
+locally first, and other CEF embedders have hit exactly this). Audio calls use Opus and are
+unaffected. The only fix is building CEF from source with
+`proprietary_codecs=true ffmpeg_branding=Chrome`, which is a full Chromium build.
+
+Nobody has published what WhatsApp Web actually negotiates for video, so a real call from this
+build is the test. `tools/login.ps1` sets that up.
+
+## Build and run
+
+```
+tools\build.ps1          # cargo build --release, plus the cmake/ninja/MSVC the cef crate needs
+tools\bundle.ps1         # assemble the trimmed shippable folder and report its size
+tools\login.ps1          # open it on the persistent profile to scan a QR
+```
+
+The first build downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`.
 
 ## Layout
 
 | file | role |
 | --- | --- |
-| `src/main.rs` | entry; resolves the mode, dispatches, shows fatal errors in a message box |
-| `src/mode.rs` | Safe/Light, the stored choice, and the first-run picker |
-| `src/webview.rs` | safe mode: window, event loop, close-to-tray, wiring |
-| `src/light.rs` | light mode: the protocol client on its own thread, events up and sends down; `--light-demo` |
-| `src/chat_ui.rs` | light mode window: main window, headers, composer, screens, events |
-| `src/ui_theme.rs` | WhatsApp's palette (light and dark), fonts, GDI+ shape helpers |
-| `src/ui_chatlist.rs` | the chat list panel, drawn row by row |
-| `src/ui_messages.rs` | the conversation panel: date pills and bubbles, cached layout |
-| `src/chats.rs` | light mode store: chats and messages, persisted as `light-chats.json` |
-| `src/notify.rs` | the notification permission fixes, per engine, the JS shim, and the Windows toast bridge |
-| `src/shortcut.rs` | the Start Menu shortcut carrying the AppUserModelID, written only when stale |
-| `src/tray.rs` | tray icon and menu |
-| `build.rs` | embeds the Windows manifest; without it the exe dies at load (Common Controls v6) |
-| `src/geometry.rs` | window placement, written only on change |
-| `src/single_instance.rs` | loopback-port lock, portable, no dependencies |
+| `src/main.rs` | entry; hands CEF's subprocesses back to CEF, handles `--quit`, shows fatal errors in a message box |
+| `src/cef_view.rs` | the whole app: window, engine, permissions, the notification bridge, tray wiring |
+| `src/notify.rs` | raising a Windows toast, and the three separate things that must be true first |
+| `src/shortcut.rs` | the Start Menu shortcut carrying the AppUserModelID, without which toasts are dropped |
+| `src/tray.rs` | tray icon and menu (embedded raw RGBA icons, no image crate) |
+| `src/geometry.rs` | window placement, written only when it changes |
+| `src/single_instance.rs` | loopback-port lock; also carries the `--quit` request |
 | `src/paths.rs` | per-OS data directory |
-| `src/bin/probe.rs` | the capability probe that established all of the above |
+| `tools/` | every instrument that produced a number in FINDINGS.md, with a README saying what each proves |
 
-Three classes from the C# original do not exist here, because the app owns its own window:
-`ChromeFinder` (no external browser to locate), `WindowFinder` (no foreign window to hunt), and
-`Hooks` (no global mouse and keyboard hook; close-to-tray is one match arm).
-
-## Build
-
-```
-cargo build --release
-```
-
-That is safe mode on the OS webview. Safe mode on Servo (DECISIONS.md #8 and #12: our own engine,
-the same on every OS, presenting as Firefox) is the `servo` feature, built against the sibling
-checkout at `../servo` on its `cache-storage-complete` branch:
-
-```
-pwsh -File tools/build-servo.ps1
-```
-
-It reproduces the environment Servo's `mach` sets up on Windows (SERVO_BUILD.md), uses the
-`servo` profile (no LTO; an engine's worth of code), and copies the ANGLE DLLs beside
-`target/servo/whatsapp.exe`.
-
-Linux build dependencies: `libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
-librsvg2-dev libsoup-3.0-dev pkg-config`.
-
-## The probe
-
-`cargo run --bin probe`, then read `probe-report.jsonl`. It reports which web APIs the local engine
-has and whether notifications actually fire. `Dockerfile.linux-probe` runs the same probe against
-WebKitGTK headlessly.
-
-## Icons
-
-`assets/icon_32.rgba` and `icon_256.rgba` are raw RGBA, pre-converted so there is no image-decoding
-dependency. To regenerate after changing `assets/icon.ico`:
-
-```python
-from PIL import Image
-for size in (32, 256):
-    frame = Image.open("assets/icon.ico").convert("RGBA").resize((size, size), Image.LANCZOS)
-    with open(f"assets/icon_{size}.rgba", "wb") as f:
-        f.write(frame.tobytes())
-```
+`FINDINGS.md` holds every measurement. `DECISIONS.md` holds the owner's rulings. Four other
+engines and a native-protocol client used to live here and were deleted after being measured;
+`git log` has them.

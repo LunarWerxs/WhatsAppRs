@@ -1,15 +1,23 @@
-//! WhatsApp, as a small desktop app, in one of two very different shapes.
+//! WhatsApp Web as a small desktop app, on a Chromium we ship.
 //!
-//! On first launch it asks which. The choice is remembered; `--choose` re-asks,
-//! and `--safe` / `--light` set it outright.
+//! One engine, one mode, no picker. Everything else this repo once had - the operating
+//! system's webview, an embedded Servo, a bundled Firefox driven as a separate process, and
+//! a native-protocol client with its own hand-drawn chat window - was built, measured against
+//! this, and deleted. FINDINGS.md and DECISIONS.md keep the numbers; `git log` keeps the code.
 //!
-//! | mode  | how it works                                  | memory  | account risk |
-//! |-------|-----------------------------------------------|---------|--------------|
-//! | safe  | the OS webview, pointed at web.whatsapp.com    | ~375 MB | none         |
-//! | light | speaks WhatsApp's protocol directly, no browser| ~12 MB  | ban, permanent |
+//! Measured on 2026-09-07, logged out, whole process tree, four minutes after the page loads:
 //!
-//! Both numbers are measured on this machine, not estimated. See `mode.rs` for
-//! why the risk is real and why safe is the default.
+//! | | processes | RAM | private | CPU over 4 min |
+//! |---|---|---|---|---|
+//! | this app | 7 | 560 MB | 376 MB | 11 s |
+//! | bundled Firefox (deleted) | 10 | 1115 MB | 1040 MB | 149 s |
+//! | the OS webview, Edge's engine (deleted) | 3 | 372 MB | 198 MB | 11 s |
+//! | plain Chrome, what the old C# app drove | 10 | 800 MB | 571 MB | 12 s |
+//!
+//! Most of that is WhatsApp's own JavaScript, not the wrapper: its heap alone is 61 MB used
+//! and 97 MB allocated on a logged-out login screen. Meta's own WhatsApp for Windows is
+//! itself a WebView2 shell around the same page, 386 MB on disk. There is no lighter way to
+//! show this website; there is only a lighter shell around it.
 
 // No console window on Windows for a GUI app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -17,43 +25,25 @@
 /// Identity Windows requires before it will render a toast for this app.
 pub(crate) const APP_ID: &str = "com.lunarwerx.whatsapp-rs";
 
-#[cfg(target_os = "windows")]
-mod chat_ui;
-mod chats;
-#[cfg(target_os = "windows")]
-mod ui_chatlist;
-#[cfg(target_os = "windows")]
-mod ui_messages;
-#[cfg(target_os = "windows")]
-mod ui_theme;
+mod cef_view;
 mod geometry;
-mod light;
-mod mode;
 mod notify;
 mod paths;
-#[cfg(feature = "cef")]
-mod cef_view;
-#[cfg(all(feature = "firefox", target_os = "windows"))]
-mod firefox_view;
-#[cfg(feature = "servo")]
-mod servo_view;
 mod shortcut;
 mod single_instance;
 mod tray;
-mod webview;
 
 fn main() {
-    // CEF re-runs THIS executable for its render, GPU and utility processes. Those must
-    // hand control straight back to CEF and exit; a subprocess that fell through into the
-    // startup below would try to take the single-instance lock and show a tray icon.
-    // Nothing else may come first.
-    #[cfg(feature = "cef")]
+    // CEF re-runs THIS executable for its render, GPU and utility processes. Those must hand
+    // control straight back to CEF and exit; a subprocess that fell through into the startup
+    // below would try to take the single-instance lock and show a tray icon. Nothing else may
+    // come first.
     if cef_view::intercept() {
         return;
     }
 
-    // `--quit` asks a running instance to shut down cleanly and exits. Killing the
-    // process instead skips the cookie flush, and on Servo that costs the login.
+    // `--quit` asks a running instance to shut down cleanly and exits. Killing the process
+    // instead skips Chromium's cookie flush, which is how a WhatsApp login gets lost.
     if std::env::args().any(|a| a == "--quit") {
         let port = std::env::var("WHATSAPP_RS_INSTANCE_PORT")
             .ok()
@@ -62,71 +52,13 @@ fn main() {
         return;
     }
 
-    let data_dir = paths::data_dir();
-
-    // No stored choice and no flag means ask. Cancelling means do not start:
-    // silently falling through to a mode the user did not pick is how someone
-    // ends up in the risky one by accident.
-    let Some(mode) = mode::resolve(&data_dir) else {
-        return;
-    };
-
-    // Safe mode's engine. Which one is a build-time choice, because the whole point of
-    // this round is a head-to-head between two bundled engines (DECISIONS.md #15); the
-    // environment variable only exists so a measurement run can force one without a
-    // rebuild, and a build that does not contain that engine says so rather than
-    // quietly falling back to a different one.
-    let result = match mode {
-        mode::Mode::Safe => run_safe(),
-        mode::Mode::Light => light::run().map_err(|e| e.to_string()),
-    };
-
-    if let Err(err) = result {
-        report_fatal(&format!("{err}"));
+    if let Err(err) = cef_view::run() {
+        report_fatal(&err);
     }
 }
 
-/// Which engine safe mode runs on.
-///
-/// | value      | engine                          | built by                |
-/// |------------|---------------------------------|-------------------------|
-/// | `cef`      | bundled Chromium 152, embedded  | `--features cef`        |
-/// | `firefox`  | bundled Firefox, adopted window | `--features firefox`    |
-/// | `webview2` | the OS webview (Edge's engine)  | always; the fallback    |
-/// | `servo`    | our Servo fork (retired, #13)   | `--features servo`      |
-fn run_safe() -> Result<(), String> {
-    let requested = std::env::var("WHATSAPP_RS_ENGINE").unwrap_or_default();
-    match requested.as_str() {
-        "cef" => {
-            #[cfg(feature = "cef")]
-            return cef_view::run();
-            #[cfg(not(feature = "cef"))]
-            return Err("this build has no bundled Chromium: rebuild with --features cef".into());
-        }
-        "firefox" => {
-            #[cfg(all(feature = "firefox", target_os = "windows"))]
-            return firefox_view::run();
-            #[cfg(not(all(feature = "firefox", target_os = "windows")))]
-            return Err("this build has no bundled Firefox: rebuild with --features firefox".into());
-        }
-        "webview2" | "os" => return webview::run().map_err(|e| e.to_string()),
-        "" => {}
-        other => return Err(format!("unknown engine {other:?}")),
-    }
-
-    // No explicit choice: whichever engine this binary was built with.
-    #[cfg(feature = "cef")]
-    return cef_view::run();
-    #[cfg(all(feature = "firefox", target_os = "windows", not(feature = "cef")))]
-    return firefox_view::run();
-    #[cfg(all(feature = "servo", not(feature = "cef"), not(feature = "firefox")))]
-    return servo_view::run().map_err(|e| e.to_string());
-    #[allow(unreachable_code)]
-    webview::run().map_err(|e| e.to_string())
-}
-
-/// A GUI app has no console to print to, so a failure that would otherwise be
-/// silent gets a message box.
+/// A GUI app has no console to print to, so a failure that would otherwise be silent gets a
+/// message box.
 fn report_fatal(message: &str) {
     #[cfg(target_os = "windows")]
     {

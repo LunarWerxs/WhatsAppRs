@@ -219,3 +219,44 @@ both render WhatsApp Web correctly from a trimmed shippable bundle.
 2. **`--single-process`.** It is what buys 352 MB instead of 560. Chromium does not support it
    and a renderer crash takes the app down. Nothing measurable breaks, and the WebView2 build
    already made the same trade.
+
+**16. The engine is a bundled Chromium, and everything else is deleted (2026-09-07).** His
+words on the comparison: "Build your recommendation. Delete the rest, make things as light...
+as reasonable." Done. `src/cef_view.rs` is the only engine; the OS webview, the embedded Servo,
+the bundled Firefox and the native-protocol light mode were all built, measured against it, and
+removed - twelve source files, sixteen instruments and a 345 MB bundled Firefox runtime. The
+binary went from 17 MB to 0.9 MB because their dependencies went with them. Everything is in
+`git log`; FINDINGS.md keeps the numbers that justified each removal.
+
+**17. NO `--single-process` (2026-09-07).** His words: "No single process." It measured 352 MB
+in one process against 490 MB in five, and it is the single biggest memory lever available, so
+this is a deliberate purchase: about 150 MB to keep the renderer isolated, because Chromium does
+not support single-process mode and a renderer crash there takes the whole app down instead of
+showing an error page. The switch is not in the code; `WHATSAPP_RS_CEF_SWITCHES=single-process`
+still reaches it for measurement.
+
+Shipped configuration, chosen by a five-way sweep on 2026-09-07: `in-process-gpu`,
+`process-per-site`, `renderer-process-limit=1`, on top of the feature-disabling switches.
+**5 processes, 490 MB** (three runs, 483-504) against 550 MB and 7 processes stock. `in-process-gpu` and deliberately
+not `disable-gpu`: disabling the GPU saved slightly more and dropped Chromium onto a software
+rasteriser, which is the shape of the mistake the Servo round made. Verified after the change
+that the page still reports the real adapter (`ANGLE (NVIDIA GeForce RTX 4070 Ti, Direct3D11)`)
+and that every capability WhatsApp needs is still present.
+
+**18. Meta's own app is not the lighter option, measured (2026-09-07).** The recurring question
+"is the real app lighter?" now has a number. It is a WebView2 shell - `WebView2Loader.dll` sits
+in its install directory - so it is Chromium too, and measured on this machine **logged in with
+the real account: 8 processes, 1110 MB working set, 801 MB private, 386 MB on disk, 254 MB of
+profile.** That is more than twice ours and it is the app he would otherwise be running. #1
+stands, and now it stands on a measurement rather than on a feeling about bloat.
+
+**19. There is no lighter WhatsApp to run, and the APK route leads back to light mode
+(2026-09-07).** He asked whether the Android app could be taken apart and run instead. It
+cannot, and the reason matters: an APK is Android bytecode plus native libraries written
+against the Android framework, so "running what is inside it" means running Android. The part
+that would actually be worth extracting - the protocol - has already been extracted by other
+people, and that library is exactly what light mode was: about 20 MB, one process, and a
+permanent ban risk, because pulling the protocol out of their app is the clause their Terms
+forbid. It was built, measured, and retired in #14 for that reason. The choice has always been
+those two things and nothing in between: speak their protocol at 20 MB with a ban risk, or
+render their website at 350-560 MB with none.
