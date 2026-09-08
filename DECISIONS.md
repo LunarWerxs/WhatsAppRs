@@ -285,3 +285,10 @@ open an issue then if their no LLM policy is written, which is some bullshit... 
 them know that the issue was opened by an AI." The issue is a bug report, not code; it says at the
 top what wrote it; the patches stay on the LunarWerxs fork as reference and are not offered as
 pull requests. Their policy, their call; the disclosure is so they can apply it.
+
+**23. v0.2.0 is one file (2026-09-08).** On seeing the 17-file zip: "that should all be, like,
+combined into a single executable." It cannot be a static binary - CEF exists only as a 271 MB
+DLL - so it is one exe carrying the engine as a compressed payload, unpacked once into
+`%LOCALAPPDATA%\WhatsAppRs\engine\<version>` on first run, with `libcef.dll` delay-loaded so the
+exe starts without it beside it. Changes the download and the click, not the disk or the RAM,
+and the README must say so. Full spec in NEXT_PROMPT.md.

@@ -26,6 +26,46 @@ a real microphone, the exe icon and version block, and the tray menu: Open, Relo
 Show notifications, Start with Windows, About, Quit. Mute is page-side and mutes only WhatsApp's
 alert tones (FINDINGS.md #16 has the rule and how it was derived); `tools\mute-check.js` proves it.
 
+## The next task: v0.2.0, ONE file (decided 2026-09-08, DECISIONS.md #23)
+
+He looked at the release zip (17 files, 347 MB unpacked, a 0.9 MB exe beside a 271 MB
+`libcef.dll`) and said it should be a single executable. It cannot be one *static* binary - CEF
+only exists as that DLL, there is no static Chromium - but it can be one file to download and
+double-click. Build exactly this:
+
+1. **The exe carries the engine as a compressed payload.** Everything `bundle.ps1 -KeepFallbacks`
+   produces except `whatsapp.exe` itself, compressed with LZMA/xz or zstd at a high level
+   (measure both; zip gave 165 MB from 347, expect ~110 MB), embedded with `include_bytes!` or
+   appended as a trailer with a footer the exe reads from its own file. Measure which starts
+   faster; a 165 MB `include_bytes!` static may cost page-in time.
+2. **First run unpacks once** into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>\` (version from
+   `CARGO_PKG_VERSION` plus a payload hash so a rebuilt 0.2.0 re-extracts). Show a small native
+   "Setting up, one moment" window during the seconds it takes; never a console. Verify the
+   unpack with per-file sizes or hashes before trusting it. Old engine folders from previous
+   versions get deleted on a successful start of the new one.
+3. **Delay-load `libcef.dll`.** Today the exe imports it at load time, so Windows refuses to
+   start the exe without the DLL beside it. Add `/DELAYLOAD:libcef.dll` (and `delayimp.lib`) as
+   linker args from `build.rs`, then before ANY CEF call - including the very first line of
+   `main`, because CEF re-runs this exe for its renderer/GPU/utility subprocesses and those must
+   find the DLL too - call `SetDllDirectoryW`/`AddDllDirectory` with the engine folder. Check
+   whether `cef-dll-sys` links `libcef.lib` in a way that fights delay-load; if it does, the
+   alternative is a `LoadLibraryW` + `GetProcAddress` shim, but try delay-load first.
+4. **Point CEF at the folder**: `Settings.resources_dir_path`, `locales_dir_path`, and
+   `browser_subprocess_path` if it helps. `chrome_elf.dll` must load before `libcef.dll` (CEF
+   requirement; check the order still holds under delay-load).
+5. **Prove it on a clean profile and from a directory that contains nothing else**: copy ONLY
+   `whatsapp.exe` to an empty folder, run it, page loads, `tools\tray-test.ps1` 3x PASS,
+   `tools\probe.ps1 -Script mute-check.js` PASS, `capability-probe.js` unchanged, then measure
+   RAM with `tools\bench.ps1 -Runs 3` and show it is the same 490 MB - the payload must not stay
+   mapped in memory after extraction.
+6. Release as v0.2.0: the single exe as the asset, SHA-256 in the notes, README's "Download and
+   run" rewritten to "download the exe, run it". Keep `bundle.ps1` as the step that produces the
+   payload.
+
+What this does NOT change, and say so in the README: disk after first run is still ~350 MB and
+RAM is identical. It is the download and the one-click experience. Meta does the same thing
+inside an MSIX.
+
 ## Still open, and both need his phone
 
 1. **A real call.** WebRTC, ICE and Opus are there; **H.264 is not** (the public CEF binaries ship
