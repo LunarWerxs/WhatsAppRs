@@ -8,11 +8,11 @@ on this machine (Windows 11, 32 cores). Numbers are measured, never estimated. R
 
 ## Where it stands
 
-**Public, released, one of everything.** `https://github.com/LunarWerxs/WhatsAppRs` (public, MIT),
-v0.1.0 attached as `whatsapp-rs-0.1.0-windows-x64.zip` (164.7 MB, unzips to 347 MB). Bundled
-Chromium through the `cef` crate as a child of our own window. Five processes, 490 MB logged out;
-Michael measured about 893 MB on his real account, which is the mailbox, not the wrapper. Four
-alternatives were built, measured and deleted; `git log` has them and FINDINGS.md has the numbers.
+**Public, released, one file.** `https://github.com/LunarWerxs/WhatsAppRs` (public, MIT), v0.2.0
+attached as a single `whatsapp-rs-0.2.0-windows-x64.exe` (129.8 MB). Bundled Chromium through the
+`cef` crate as a child of our own window. Five processes, 490 MB logged out; Michael measured
+about 893 MB on his real account, which is the mailbox, not the wrapper. Four alternatives were
+built, measured and deleted; `git log` has them and FINDINGS.md has the numbers.
 
 | logged out, whole process tree | processes | RAM | private |
 | --- | --- | --- | --- |
@@ -26,45 +26,15 @@ a real microphone, the exe icon and version block, and the tray menu: Open, Relo
 Show notifications, Start with Windows, About, Quit. Mute is page-side and mutes only WhatsApp's
 alert tones (FINDINGS.md #16 has the rule and how it was derived); `tools\mute-check.js` proves it.
 
-## The next task: v0.2.0, ONE file (decided 2026-09-08, DECISIONS.md #23)
-
-He looked at the release zip (17 files, 347 MB unpacked, a 0.9 MB exe beside a 271 MB
-`libcef.dll`) and said it should be a single executable. It cannot be one *static* binary - CEF
-only exists as that DLL, there is no static Chromium - but it can be one file to download and
-double-click. Build exactly this:
-
-1. **The exe carries the engine as a compressed payload.** Everything `bundle.ps1 -KeepFallbacks`
-   produces except `whatsapp.exe` itself, compressed with LZMA/xz or zstd at a high level
-   (measure both; zip gave 165 MB from 347, expect ~110 MB), embedded with `include_bytes!` or
-   appended as a trailer with a footer the exe reads from its own file. Measure which starts
-   faster; a 165 MB `include_bytes!` static may cost page-in time.
-2. **First run unpacks once** into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>\` (version from
-   `CARGO_PKG_VERSION` plus a payload hash so a rebuilt 0.2.0 re-extracts). Show a small native
-   "Setting up, one moment" window during the seconds it takes; never a console. Verify the
-   unpack with per-file sizes or hashes before trusting it. Old engine folders from previous
-   versions get deleted on a successful start of the new one.
-3. **Delay-load `libcef.dll`.** Today the exe imports it at load time, so Windows refuses to
-   start the exe without the DLL beside it. Add `/DELAYLOAD:libcef.dll` (and `delayimp.lib`) as
-   linker args from `build.rs`, then before ANY CEF call - including the very first line of
-   `main`, because CEF re-runs this exe for its renderer/GPU/utility subprocesses and those must
-   find the DLL too - call `SetDllDirectoryW`/`AddDllDirectory` with the engine folder. Check
-   whether `cef-dll-sys` links `libcef.lib` in a way that fights delay-load; if it does, the
-   alternative is a `LoadLibraryW` + `GetProcAddress` shim, but try delay-load first.
-4. **Point CEF at the folder**: `Settings.resources_dir_path`, `locales_dir_path`, and
-   `browser_subprocess_path` if it helps. `chrome_elf.dll` must load before `libcef.dll` (CEF
-   requirement; check the order still holds under delay-load).
-5. **Prove it on a clean profile and from a directory that contains nothing else**: copy ONLY
-   `whatsapp.exe` to an empty folder, run it, page loads, `tools\tray-test.ps1` 3x PASS,
-   `tools\probe.ps1 -Script mute-check.js` PASS, `capability-probe.js` unchanged, then measure
-   RAM with `tools\bench.ps1 -Runs 3` and show it is the same 490 MB - the payload must not stay
-   mapped in memory after extraction.
-6. Release as v0.2.0: the single exe as the asset, SHA-256 in the notes, README's "Download and
-   run" rewritten to "download the exe, run it". Keep `bundle.ps1` as the step that produces the
-   payload.
-
-What this does NOT change, and say so in the README: disk after first run is still ~350 MB and
-RAM is identical. It is the download and the one-click experience. Meta does the same thing
-inside an MSIX.
+**v0.2.0 is one executable** (DECISIONS.md #23, FINDINGS.md #17). It cannot be one *static*
+binary - CEF exists only as a 271 MB DLL - so the engine is appended to the exe as one zstd frame
+with a 64-byte footer, and unpacks itself into
+`%LOCALAPPDATA%\WhatsAppRs\engine\<version>-<payload id>` on first run, in about four seconds
+behind a small progress window. `libcef.dll` is delay-loaded (`build.rs`), and `engine::prepare`
+runs before anything CEF-related - ahead of `cef_view::intercept`, and behind only the `--quit`
+branch, which touches no CEF entry point - because CEF re-runs this exe
+for its subprocesses and they must find the DLL too. Proved by copying ONLY that file into an
+empty folder: `tools\single-test.ps1`.
 
 ## Still open, and both need his phone
 
@@ -85,6 +55,17 @@ python tools\bench-summary.py tools\bench.jsonl
 
 Quit from the tray, not Task Manager: Chromium flushes cookies on a clean shutdown.
 
+## Worth doing next, in the order I would do them
+
+1. **CI.** There is none. A `windows-latest` workflow that runs `build.ps1`, `single-exe.ps1` and
+   attaches the exe would remove the "it built on my machine" risk entirely; the cef crate's build
+   needs cmake, ninja and `rc.exe`, all present on that runner, and `pack-payload.py` needs
+   `pip install zstandard`.
+2. **SmartScreen.** The exe is unsigned, so a stranger downloading it gets "Windows protected
+   your PC" and has to click More info -> Run anyway. That is a code-signing certificate (money,
+   his call), not a code change. It was true of v0.1.0's zip too.
+3. **A real video call and a real-account bench** (above). Both need his phone.
+
 ## Releasing the next version
 
 ```
@@ -92,14 +73,13 @@ Quit from the tray, not Task Manager: Chromium flushes cookies on a clean shutdo
 tools\build.ps1
 tools\tray-test.ps1                                   # 3x PASS or stop
 tools\probe.ps1 -Script mute-check.js                 # PASS or stop
-tools\bundle.ps1 -KeepFallbacks                       # -> D:\wa-bundle\whatsapp
-Compress-Archive D:\wa-bundle\whatsapp D:\wa-bundle\whatsapp-rs-<v>-windows-x64.zip
-gh release create v<v> D:\wa-bundle\whatsapp-rs-<v>-windows-x64.zip --title "v<v>" --notes-file <notes>
+tools\single-exe.ps1                                  # -> D:\wa-bundle\whatsapp-rs-<v>-windows-x64.exe
+tools\single-test.ps1                                 # only that file, empty folder, twice
+tools\bench.ps1 -Runs 3 -Exe D:\wa-single-test\whatsapp.exe    # still ~490 MB or stop
+gh release create v<v> D:\wa-bundle\whatsapp-rs-<v>-windows-x64.exe --title "v<v>" --notes-file <notes>
 ```
 
 The repo is PUBLIC: before any push, say so in a heading at the top of the reply (Jacob's rule).
-There is no CI yet; a workflow that builds on `windows-latest` and attaches the zip is the obvious
-next thing, and the cef crate's build needs cmake, ninja and `rc.exe`, all present on that runner.
 
 ## Servo: closed, do not reopen
 
@@ -120,6 +100,11 @@ request. `servo-patches/` in this repo is the same material. Do not push those b
   (#13, #14, #16). Firefox used 1115 MB and fifteen times the CPU, and cannot be embedded at all.
 - **Meta's own app is not lighter** (#18): 1110 MB, and it is a WebView2 shell, so Chromium too.
 - **The Android APK route leads back to light mode** (#19): 20 MB, one process, permanent ban risk.
+- **The single exe does not make the app smaller** (#23). Disk after first run is still ~350 MB
+  and RAM is unchanged; it bought the download and the one click. Do not let anyone, including
+  the README, imply otherwise.
+- **zstd, not xz** (FINDINGS #17). xz is 6 MB smaller and 7x slower to unpack, and the unpack is
+  on every stranger's first run. Re-measure with `pack-payload.py --measure` before changing it.
 
 ## Traps this cost, so nobody pays for them twice
 
@@ -134,6 +119,12 @@ request. `servo-patches/` in this repo is the same material. Do not push those b
   stick, so it uses `Object.defineProperty` and re-installs on DOMContentLoaded.
 - **The page's own tones are the only sound.** The Windows toast was always silent (notify-rust
   passes no sound name). Muting means intercepting `HTMLMediaElement.prototype.play`.
+- **`engine::prepare` must stay ahead of everything CEF-related in `main`.** CEF's renderer, GPU and utility
+  processes are re-runs of this exe and reach `main` the same way; anything CEF-related before it
+  would touch a DLL that is not loaded yet.
+- **Inside a PowerShell function, a bare string is part of the RETURN value, not output.** The
+  first `single-test.ps1` printed nothing and stuffed its whole report into `$p`. Use `Write-Host`
+  in functions.
 - **`Start-Process -ArgumentList @(...)` joins the array with no quoting.** A `-Run "pwsh -File x"`
   value inside it gets split and the receiving script sees `-NoProfile` as its own parameter. Pass
   one string. And `& python ...` from a detached script dies with "No process is on the other end
@@ -153,3 +144,6 @@ request. `servo-patches/` in this repo is the same material. Do not push those b
 - He is, reasonably, angry that showing WhatsApp costs 500 MB. It is Meta's doing. Do not pretend
   there is a third way.
 - Do not open a visible console window; detached runs go hidden with output to a log.
+- **Never touch `%LOCALAPPDATA%\WhatsAppRs`** - that is his real login. Test profiles go through
+  `WHATSAPP_RS_DATA_DIR`, and the engine folder follows it, so a test never shares an engine with
+  the real install either.

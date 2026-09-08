@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "WhatsApp Web as a small native tray app, on a Chromium we ship"
 
@@ -22,6 +22,14 @@ path = "src/main.rs"
 # chose it was engine-to-engine and not version-to-version. `sandbox` is off because CEF's
 # Windows sandbox needs a second bootstrap executable, which would make this two binaries.
 cef = { version = "152.0.0", default-features = false, features = ["resources"] }
+
+# Unpacking the engine the exe carries. v0.2.0 ships as ONE file: everything the old 17-file
+# folder held travels inside the exe as a single zstd frame and unpacks on first run. zstd
+# rather than xz because it was measured, not assumed: 128.4 MB against xz -9e's 122.1, and
+# 0.50 s to decompress against 3.64 - three seconds off every stranger's first run, for 6 MB
+# of extra download. `default-features = false` drops the dictionary builder and the legacy
+# format decoders, neither of which a payload we produce ourselves will ever need.
+zstd = { version = "0.13", default-features = false }
 
 # Our window, our tray, our menu.
 tao = "0.37.0"
@@ -49,6 +57,14 @@ features = [
   "Win32_Storage_FileSystem",
   # PKEY_AppUserModel_ID lives in EnhancedStorage, of all places.
   "Win32_Storage_EnhancedStorage",
+  # engine.rs: SetDllDirectoryW, and the LoadLibraryExW that pulls chrome_elf.dll and the
+  # delay-loaded libcef.dll out of the unpacked engine folder.
+  "Win32_System_LibraryLoader",
+  # setup_window.rs: the progress bar (InitCommonControlsEx, PROGRESS_CLASSW), the system UI
+  # font its two lines are drawn in, and the DPI it scales itself by.
+  "Win32_UI_Controls",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_HiDpi",
 ]
 
 # Embeds the Windows manifest: common controls v6 and per-monitor DPI awareness. See build.rs.

@@ -4,27 +4,42 @@ WhatsApp Web as a small native tray app for Windows, on a Chromium it ships itse
 scratch, no forked code, MIT licensed. Not made by or affiliated with WhatsApp or Meta;
 "WhatsApp" is their trademark and the page it shows is theirs.
 
-**0.9 MB binary, ~350 MB of bundled engine beside it, 5 processes, 490 MB of RAM logged out.**
-Most of that is WhatsApp's own JavaScript, not this wrapper. See "Why it is 500 MB" below,
-because that is the question everybody asks and it has a measured answer.
+**One executable, no installer, nothing to unzip.** 130 MB to download, 5 processes, 490 MB of
+RAM logged out. Most of that is WhatsApp's own JavaScript, not this wrapper. See "Why it is
+500 MB" below, because that is the question everybody asks and it has a measured answer.
 
 ## Download and run
 
-1. Get `whatsapp-rs-<version>-windows-x64.zip` from the
+1. Download `whatsapp-rs-<version>-windows-x64.exe` from the
    [latest release](https://github.com/LunarWerxs/WhatsAppRs/releases/latest).
-2. Unzip it anywhere (a folder under `%LOCALAPPDATA%\Programs` is the usual place). There is no
-   installer: the folder is the install.
-3. Run `whatsapp.exe`, scan the QR code with your phone, done. Closing the window hides it to
-   the tray; right-click the tray icon to quit.
+2. Run it. Scan the QR code with your phone. Done.
 
-Windows 10 or 11, 64-bit. The first run writes one Start Menu shortcut, `WhatsApp Rs`, because
-Windows will not show toast notifications for a program that has none. Your login and message
-cache live in `%LOCALAPPDATA%\WhatsAppRs`. To uninstall, delete the unzipped folder, that
-directory, and the shortcut (plus the one in your Startup folder if you turned "Start with
-Windows" on). Nothing else is touched.
+That is the whole thing. Put the exe wherever you like; nothing has to sit beside it. Closing the
+window hides it to the tray; right-click the tray icon to quit.
+
+**What the first run does, in about four seconds behind a small "Setting up" window:** it unpacks
+the browser engine it is carrying into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>-<id>`, where
+the id is a short hash of the engine so a rebuilt version cannot be confused with an old one. That
+folder
+is ~350 MB and it stays there. **The single file is the download and the click; it is not a
+smaller program.** Disk after first run and memory while running are exactly what v0.1.0's
+17-file folder cost, because it is the same engine - Chromium exists only as a 271 MB DLL and
+there is no static build of it, so no wrapper can be genuinely smaller. Meta does the same thing
+inside an MSIX. A later version unpacks its own folder and deletes the old one.
+
+Windows 10 or 11, 64-bit. The first run also writes one Start Menu shortcut, `WhatsApp Rs`,
+because Windows will not show toast notifications for a program that has none. Your login and
+message cache live in `%LOCALAPPDATA%\WhatsAppRs`. To uninstall, delete the exe, that directory
+(the engine is inside it), and the shortcut - plus the one in your Startup folder if you turned
+"Start with Windows" on. Nothing else is touched.
 
 **Quit from the tray menu, not from Task Manager.** A clean quit lets Chromium flush its cookies;
 a kill can lose the login and cost you another QR scan.
+
+**The exe is not code-signed** (`Get-AuthenticodeSignature` says `NotSigned`), so Windows
+SmartScreen shows "Windows protected your PC" the first time: More info, then Run anyway. A
+certificate costs money and is on the list; until then, the SHA-256 is in the release notes and
+`Get-FileHash` will tell you the download is the file that was published.
 
 ## What it does
 
@@ -110,21 +125,31 @@ build is the test. If you make one, open an issue with the result either way.
 
 ```
 tools\build.ps1          # cargo build --release, plus the cmake/ninja/MSVC the cef crate needs
-tools\bundle.ps1 -KeepFallbacks   # assemble the shippable folder and report its size
+tools\single-exe.ps1     # bundle, compress, append -> the one file the release ships
+tools\single-test.ps1    # prove it: that file alone, in an empty folder, started twice
 tools\login.ps1          # open it on the persistent profile to scan a QR
 ```
 
 Needs a Rust toolchain, Visual Studio Build Tools with the Windows SDK (`cmake`, `ninja`,
-`rc.exe`), and about 1 GB of disk for the engine. The first build downloads the 171 MB CEF binary
-distribution into `%USERPROFILE%\.local\share\cef`. The release zip is exactly what `bundle.ps1
--KeepFallbacks` produces: the required CEF files, one locale, and the software-rendering fallback
-for machines without a working GPU driver.
+`rc.exe`), Python 3 with `zstandard`, and about 1 GB of disk for the engine. The first build
+downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`.
+
+A build straight out of `target\release` runs from there with the engine beside it, which is what
+every test script uses and what the development loop depends on. `single-exe.ps1` then takes what
+`bundle.ps1 -KeepFallbacks` assembles - the required CEF files, one locale, and the
+software-rendering fallback for machines without a working GPU driver - compresses the sixteen
+files that are not the exe into one zstd frame, and writes the exe, that frame and a 64-byte
+footer as a single file. Windows ignores bytes past the end of a PE image, so the result is an
+ordinary executable. `libcef.dll` is delay-loaded, which is what lets it start with nothing
+beside it at all.
 
 ## Layout
 
 | file | role |
 | --- | --- |
-| `src/main.rs` | entry; hands CEF's subprocesses back to CEF, handles `--quit`, shows fatal errors in a message box |
+| `src/main.rs` | entry; finds or unpacks the engine, hands CEF's subprocesses back to CEF, handles `--quit`, shows fatal errors in a message box |
+| `src/engine.rs` | the engine the exe carries: the footer, the container format, unpack-and-verify, loading the DLLs, deleting old versions |
+| `src/setup_window.rs` | the small "Setting up" window with its progress bar, on its own thread, shown only while unpacking |
 | `src/cef_view.rs` | the whole app: window, engine, permissions, the notification bridge and mute shim, tray wiring |
 | `src/notify.rs` | raising a Windows toast, and the three separate things that must be true first |
 | `src/shortcut.rs` | the Start Menu shortcut carrying the AppUserModelID, and the Startup-folder one behind "Start with Windows" |

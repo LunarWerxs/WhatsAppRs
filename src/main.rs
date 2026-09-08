@@ -26,26 +26,33 @@
 pub(crate) const APP_ID: &str = "com.lunarwerx.whatsapp-rs";
 
 mod cef_view;
+mod engine;
 mod geometry;
 mod notify;
 mod paths;
 mod settings;
+mod setup_window;
 mod shortcut;
 mod single_instance;
 mod tray;
 
 fn main() {
-    // CEF re-runs THIS executable for its render, GPU and utility processes. Those must hand
-    // control straight back to CEF and exit; a subprocess that fell through into the startup
-    // below would try to take the single-instance lock and show a tray icon. Nothing else may
-    // come first.
-    if cef_view::intercept() {
-        return;
-    }
+    // CEF re-runs THIS executable for its render, GPU and utility processes, marking each one
+    // with a `--type=` switch. Two things follow, and the order below is exactly those two:
+    //
+    // 1. Every process, ours and CEF's, has to be able to FIND `libcef.dll` before it makes a
+    //    CEF call. Since v0.2.0 the DLL is not beside the exe - the exe carries it compressed
+    //    and unpacks it into %LOCALAPPDATA% - so `engine::prepare` comes first, always. The
+    //    DLL is delay-loaded (see build.rs), which is what lets the process start without it.
+    // 2. A subprocess must hand control straight back to CEF and exit. One that fell through
+    //    into the startup below would take the single-instance lock and show a tray icon.
+    let is_subprocess = std::env::args().any(|a| a.starts_with("--type="));
 
     // `--quit` asks a running instance to shut down cleanly and exits. Killing the process
-    // instead skips Chromium's cookie flush, which is how a WhatsApp login gets lost.
-    if std::env::args().any(|a| a == "--quit") {
+    // instead skips Chromium's cookie flush, which is how a WhatsApp login gets lost. It
+    // touches no CEF entry point, so it is answered before the engine is even looked for:
+    // otherwise asking a running app to quit could start an unpack of its own.
+    if !is_subprocess && std::env::args().any(|a| a == "--quit") {
         let port = std::env::var("WHATSAPP_RS_INSTANCE_PORT")
             .ok()
             .and_then(|p| p.parse::<u16>().ok());
@@ -53,7 +60,22 @@ fn main() {
         return;
     }
 
-    if let Err(err) = cef_view::run() {
+    let engine = match engine::prepare(is_subprocess) {
+        Ok(engine) => engine,
+        Err(err) => {
+            // A subprocess has no window and no user to tell; CEF reports its death itself.
+            if !is_subprocess {
+                report_fatal(&err);
+            }
+            return;
+        }
+    };
+
+    if cef_view::intercept() {
+        return;
+    }
+
+    if let Err(err) = cef_view::run(&engine) {
         report_fatal(&err);
     }
 }

@@ -28,6 +28,26 @@ fn main() {
         res.set("FileDescription", "WhatsApp Web as a small tray app");
         res.set("LegalCopyright", "MIT License");
         res.compile().expect("failed to compile the Windows resource (is rc.exe on PATH?)");
+
+        // Delay-load libcef.dll, which is what makes v0.2.0's single executable possible.
+        //
+        // The exe imports twelve symbols from libcef.dll and Windows resolves those before
+        // `main` runs, so without this the loader refuses to start the exe at all unless a
+        // 271 MB libcef.dll is sitting beside it - and the whole point is that it is not:
+        // the exe carries it compressed and unpacks it to %LOCALAPPDATA% on first run. With
+        // /DELAYLOAD the import is resolved on the first CEF call instead, by which time
+        // `engine::prepare` (the first statement in `main`, in every process CEF starts) has
+        // already loaded the real DLL by full path.
+        //
+        // All twelve imports are functions - `dumpbin -imports` says so, and it matters:
+        // delay-load rewrites call thunks, so a *data* import from the same DLL cannot be
+        // delayed and would fail at link time.
+        //
+        // `delayimp.lib` is the helper that does the loading. It is a static archive from the
+        // MSVC lib directory rather than an import library, so it goes through as a plain
+        // linker argument; `-bins` keeps both flags off the build script's own link.
+        println!("cargo:rustc-link-arg-bins=/DELAYLOAD:libcef.dll");
+        println!("cargo:rustc-link-arg-bins=delayimp.lib");
     }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=assets/icon.ico");

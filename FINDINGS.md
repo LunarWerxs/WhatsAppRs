@@ -1067,3 +1067,185 @@ call returns 32x32 from the exe, and `VersionInfo` reads back the four fields.
 **The release**: `bundle.ps1 -KeepFallbacks` - 346.9 MB in 17 files, the software-rendering
 fallback kept this time because a public build meets machines without a working GPU driver -
 zipped to 164.7 MB, SHA-256 `8F6BBF6F…C71713`, published as v0.1.0.
+
+## 17. One executable: the engine travels inside it (2026-09-08)
+
+DECISIONS.md #23: "that should all be, like, combined into a single executable." v0.1.0 was a
+17-file zip that unpacked to 347 MB, a 0.9 MB `whatsapp.exe` beside a 271 MB `libcef.dll`. v0.2.0
+is **one 129.8 MB file**, and everything below is measured on it.
+
+It cannot be a static binary. CEF exists only as that DLL; there is no static Chromium and no
+switch that makes one. So the engine travels *behind* the executable instead of inside it.
+
+### The shape
+
+`tools/single-exe.ps1` writes `whatsapp.exe` unchanged, appends the sixteen other bundle files
+compressed into one zstd frame, and ends with a 64-byte footer (payload length, stream length,
+SHA-256 of the payload, codec, format version, magic). Windows ignores bytes past the end of a
+PE image, so the result is an ordinary executable that happens to be 129.8 MB. `src/engine.rs`
+opens its own file, reads the last 64 bytes, and knows where its payload starts.
+
+The container inside the frame is 40 lines of format: a magic, a file count, then per file a
+path, a size and a CRC-32, then the contents concatenated. A tar crate and a compression crate
+would have been two dependencies for a format nobody else will ever open, and the CRC is what
+lets the unpacker verify each file as it writes it rather than trusting the write.
+
+### The codec was measured, not assumed
+
+`python tools/pack-payload.py <bundle> --measure`, over the real 362,736,869-byte engine stream:
+
+| codec | size | ratio | pack | unpack |
+| --- | --- | --- | --- | --- |
+| zstd -19 | 131.2 MB | 2.76x | 41.6 s | 0.51 s |
+| **zstd -22** | **128.4 MB** | **2.82x** | 167.8 s | **0.50 s** |
+| xz -6e | 126.2 MB | 2.87x | 107.9 s | 3.65 s |
+| xz -9e | 122.1 MB | 2.97x | 153.2 s | 3.64 s |
+
+xz wins on size by 6.3 MB (5%) and loses on decompression by 7x. Six megabytes of download once
+is worth less than three seconds on every stranger's first run, so zstd -22 with a 128 MB window
+ships. NEXT_PROMPT expected ~110 MB; 128 MB is what the bytes actually gave, and a 285 MB DLL of
+already-compressed machine code is why. Against the v0.1.0 zip (164.7 MB) it is still 35 MB less
+to download, because zip's per-file deflate cannot match across a 346 MB stream.
+
+### Delay-load is the part that makes it possible at all
+
+The exe imports twelve symbols from `libcef.dll`, and Windows resolves an import table **before**
+`main` runs. So an unmodified build simply refuses to start without a 271 MB DLL beside it -
+which is every copy of this exe until it has unpacked itself. `build.rs` now passes
+`/DELAYLOAD:libcef.dll` and `delayimp.lib`; `dumpbin -dependents` confirms `libcef.dll` moved
+from "dependencies" to "delay load dependencies". The precondition was checked first with
+`dumpbin -imports`: all twelve are functions. Delay-load rewrites call thunks, so a *data* import
+from the same DLL could not be delayed, and libcef exports no data at all (249 exports, all
+functions).
+
+`engine::prepare` therefore runs ahead of `cef_view::intercept` and of everything else in `main`
+except the `--quit` branch (which talks to a socket and exits, touching no CEF entry point),
+because **CEF re-runs this executable for its renderer, GPU and utility processes** and those
+reach `main` the same way. Each one computes the engine folder (a 64-byte read from its own
+file), calls `SetDllDirectoryW` on it, and loads `chrome_elf.dll` then `libcef.dll` by full path
+with `LOAD_WITH_ALTERED_SEARCH_PATH`. `libcef.dll` names `chrome_elf.dll` as a load-time
+dependency, so the order is CEF's requirement, not a preference. When the delay-load helper later
+calls `LoadLibraryA("libcef.dll")` with the bare name, the loader answers it with the module of
+that base name already in the process - the one loaded from the engine folder.
+
+`SetDllDirectoryW` covers what comes after: ANGLE asks for `libEGL.dll` and `libGLESv2.dll` by
+name, and the software fallback for `vk_swiftshader.dll`, `vulkan-1.dll`, `dxcompiler.dll`,
+`dxil.dll` and `d3dcompiler_47.dll`. That it works is not asserted: `gfx-probe.js` on the single
+exe still reports `ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Ti (0x00002782) Direct3D11 vs_5_0
+ps_5_0, D3D11)` and `looks_software: false`.
+
+### Unpacking
+
+Into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>-<first 8 bytes of the payload hash>`, so a
+rebuilt 0.2.0 with a different engine gets its own folder instead of being mistaken for the old
+one. It writes to `.tmp-<pid>` and renames, so an interrupted run leaves an obviously unfinished
+folder rather than a plausible broken one, and the manifest (`engine.ok`) is written last - its
+presence is what "finished" means. Every subsequent start, including every CEF subprocess, reads
+that manifest and checks each file's size; re-checksumming 346 MB five times per launch would
+cost real time to prove something the extractor already proved byte by byte.
+
+Two double-clicks in a row start two processes, and both reach the unpack before either takes
+the single-instance lock - that lock lives on the far side of `cef_initialize`, which cannot be
+called until the engine exists. So the loser of that race adopts the winner's folder instead of
+failing. Old versions' folders are deleted on a background thread after the browser is up, with
+the manifest removed first so a delete that fails half way (another build still has those DLLs
+mapped) leaves something that re-extracts rather than something that looks finished.
+
+During the unpack a small native window says "Setting up WhatsApp" with a progress bar. It runs
+on its own thread with its own message pump - a window belongs to the thread that created it -
+and the extractor only bumps an `AtomicU64` the window's timer reads. Without it, a first run is
+several seconds of nothing at all, which is indistinguishable from a program that failed to
+start, so the user double-clicks again and now two processes are racing.
+
+### The proof, on a copy of only that file in an empty folder
+
+`tools/single-test.ps1`, and then the existing instruments pointed at the same copy with `-Exe`:
+
+```
+folder   : 1 file(s) -> PASS
+first start : 4.4s to a loaded page -> PASS   {"state":"qr", ... ,"ua_brand":"Chrome 152.0.0.0"}
+first engine: ...\engine\0.2.0-9265a414a9191e7c (unpacked by this run)
+engine   : 0.2.0-9265a414a9191e7c  17 files  345.9 MB
+second start: 8.7s to a loaded page -> PASS
+second engine: ...\engine\0.2.0-9265a414a9191e7c (already unpacked)
+```
+
+- `tray-test.ps1` three times: close-to-tray, restore, clean quit - **9 of 9 PASS**.
+- `probe.ps1 -Script mute-check.js`: `patched=true pushed_at_load=true`, tone muted on and only
+  on, `verdict PASS`.
+- `capability-probe.js`: **unchanged** from v0.1.0 - service worker registered and controlling,
+  IndexedDB, SubtleCrypto, WebAssembly, SharedWorker, Web Locks, OPFS, mediaDevices, WebRTC,
+  WebGL, secure context, notification permission `granted`.
+- Under its real release filename (`whatsapp-rs-0.2.0-windows-x64.exe`, not `whatsapp.exe`) in
+  its own empty folder: window titled WhatsApp, 5 processes, `--quit` exits cleanly. Worth doing
+  because that is the name a stranger's download actually has.
+- `pack-payload.py --verify` reads the packed exe back independently of the writer: footer hash
+  matches, 16 files, every CRC matches, nothing left over.
+- `cargo test`: 3 passed - the CRC-32 against `zlib.crc32`'s own vectors, the same CRC split
+  across chunk boundaries, and the payload-path guard refusing `..`, absolute and drive paths.
+- The development loop is untouched: a build in `target\release` still finds the engine beside
+  it and logs `(beside the exe)`, unpacking nothing.
+
+### Memory: identical, which is the whole point
+
+`bench.ps1 -Runs 3`, whole process tree, sampled 60 s and 240 s after the page reports ready:
+
+| | n | ready | ws@60 | ws@240 | private@240 | proc | fps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| v0.1.0, the 17-file folder | 3 | 3.3 s | 483.2 MB | 489.6 MB | 347.3 MB | 5 | 120.3 |
+| **v0.2.0, the single exe** | 3 | 3.2 s | 501.0 MB | **494.7 MB** | 349.3 MB | 5 | 120.3 |
+
+5.1 MB apart at four minutes, inside v0.1.0's own 483.2-504.5 MB spread and inside v0.2.0's own
+492.1-500.7. **The 128 MB payload does not stay resident**, which was the thing worth checking: it
+is read once through a streaming decoder and never mapped. The bench's profile column reads 386 MB
+rather than 40 MB for the same reason it should - the engine folder now lives inside the data
+directory it measures.
+
+### Deleting the old version's engine, proved both ways
+
+A folder that has served its purpose and 346 MB of dead weight look the same from outside, so the
+sweep was tested with both in the engine root at once: a fake `0.1.9-deadbeefdeadbeef` carrying a
+valid manifest, and a `backup-0123456789abcdef` that carries none. Started the app, quit it, looked:
+
+```
+before: 0.1.9-deadbeefdeadbeef, 0.2.0-9265a414a9191e7c, backup-0123456789abcdef
+after : 0.2.0-9265a414a9191e7c, backup-0123456789abcdef
+```
+
+The old engine went, the stranger's folder stayed, the live one was untouched. Under the earlier
+name-based rule the second row would have lost `backup-0123456789abcdef` too.
+
+### What an adversarial review of it found, and what that changed
+
+Five reviewers over the new code and the docs, every claim then handed to a separate agent whose
+job was to refute it. Nine survived, all nine were real, all nine are fixed. Worth writing down
+because two of them were the kind that never shows up in a passing test:
+
+1. **The setup window could have hung the app forever.** The first version drove its progress bar
+   from a `SetTimer` tick inside a `GetMessageW` loop. `SetTimer` can fail (the per-session timer
+   table is finite), and a `GetMessageW` loop whose only wake-up never arrives blocks forever - so
+   the window thread would never exit, `Window::close`'s join would never return, and the unpack
+   would never finish, on a machine that gave no other symptom. It is now a `PeekMessage` drain
+   with a 30 ms sleep, whose exit condition is the `stop` flag and nothing else.
+2. **`sweep_old` decided "this folder is mine" from its NAME** - anything ending in a hyphen and
+   16 hex digits. `WHATSAPP_RS_ENGINE_DIR` deliberately points that at shared scratch
+   directories, so a `backup-0123456789abcdef` someone else left there would have been deleted.
+   It now asks for the manifest this code writes, which is the only honest test of authorship.
+3. The truncation guard used plain `u64` addition on a field read from a stranger's disk;
+   `u64::MAX - 63` wrapped it to zero and sailed through. Checked arithmetic now, and the
+   index's own sizes are checked against the footer's `stream_len` before 346 MB is written.
+4. The progress bar could never reach 100%: its total was the whole stream but the counter only
+   counted file contents, never the index. The total is now the sum of the file sizes.
+5. `--verify` ignored the codec byte and always tried zstd, so it would have failed on anything
+   packed with `--codec xz:9`, which is a documented option. It reads the byte now.
+6. `single-exe.ps1` shipped an artifact nobody had read back. It now runs `--verify` on its own
+   output and refuses to finish if the file does not parse, and prints the SHA-256.
+7. An HFONT leak, the README quoting the engine path without its `-<id>` suffix, and the claim
+   that `engine::prepare` is "the first statement in `main`" when `--quit` legitimately comes
+   first. All corrected.
+
+### What it does not change, and the README says so
+
+Disk after first run is the same ~350 MB and memory is identical, because it is the same engine.
+This bought the download and the double-click, nothing else. Meta ships the same trick inside an
+MSIX.

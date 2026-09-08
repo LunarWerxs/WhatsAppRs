@@ -107,7 +107,7 @@ enum UserEvent {
     MenuQuit,
 }
 
-pub(crate) fn run() -> Result<(), String> {
+pub(crate) fn run(engine: &crate::engine::Engine) -> Result<(), String> {
     let listener = match single_instance::acquire() {
         single_instance::Instance::Second => return Ok(()),
         single_instance::Instance::First(l) => l,
@@ -152,7 +152,20 @@ pub(crate) fn run() -> Result<(), String> {
 
     let args = args::Args::new();
 
-    let cef_dir = runtime_dir()?;
+    let cef_dir = engine.dir.clone();
+    // Which engine this run is using, and whether this run is the one that unpacked it.
+    // It is the one line that tells a test whether it exercised first run or second.
+    eprintln!(
+        "[whatsapp-rs] engine {} ({})",
+        cef_dir.display(),
+        if engine.beside_exe {
+            "beside the exe"
+        } else if engine.extracted {
+            "unpacked by this run"
+        } else {
+            "already unpacked"
+        }
+    );
     let mut settings = Settings {
         // CEF's own sandbox needs a separate bootstrap executable on Windows; without
         // it every subprocess must be told the sandbox is off or it refuses to start.
@@ -169,7 +182,8 @@ pub(crate) fn run() -> Result<(), String> {
         log_file: CefString::from(&*data_dir.join("cef.log").to_string_lossy()),
         ..Default::default()
     };
-    // The bundled runtime lives beside the exe, not in a Chrome install.
+    // The bundled runtime lives in the folder the exe unpacked itself into (or beside the
+    // exe for a build straight out of target\release), never in a Chrome install.
     settings.resources_dir_path = CefString::from(&*cef_dir.to_string_lossy());
     settings.locales_dir_path = CefString::from(&*cef_dir.join("locales").to_string_lossy());
 
@@ -197,6 +211,14 @@ pub(crate) fn run() -> Result<(), String> {
     ) != 1
     {
         return Err("cef initialize failed; see cef.log beside the profile".into());
+    }
+
+    // The engine started, so the folders older versions unpacked themselves into are dead
+    // weight - ~350 MB each. Deleting them walks a lot of files, so it happens off the
+    // startup path; nothing waits on it and a failure is not worth reporting.
+    if !engine.beside_exe {
+        let keep = engine.dir.clone();
+        std::thread::spawn(move || crate::engine::sweep_old(&keep));
     }
 
     let tray = tray::build(tray::State {
@@ -334,22 +356,6 @@ pub(crate) fn run() -> Result<(), String> {
             _ => {}
         }
     });
-}
-
-/// Where the bundled engine's `.pak` files and `locales/` live: beside the executable.
-fn runtime_dir() -> Result<std::path::PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| "executable has no parent directory".to_string())?
-        .to_path_buf();
-    if !dir.join("resources.pak").exists() {
-        return Err(format!(
-            "the bundled Chromium is missing: no resources.pak beside {}",
-            exe.display()
-        ));
-    }
-    Ok(dir)
 }
 
 /// Alloy, and the reason is measured, not preferred.

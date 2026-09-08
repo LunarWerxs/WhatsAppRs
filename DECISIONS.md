@@ -291,4 +291,12 @@ combined into a single executable." It cannot be a static binary - CEF exists on
 DLL - so it is one exe carrying the engine as a compressed payload, unpacked once into
 `%LOCALAPPDATA%\WhatsAppRs\engine\<version>` on first run, with `libcef.dll` delay-loaded so the
 exe starts without it beside it. Changes the download and the click, not the disk or the RAM,
-and the README must say so. Full spec in NEXT_PROMPT.md.
+and the README must say so.
+
+**Shipped 2026-09-08 as v0.2.0: one 129.8 MB file.** zstd -22 over xz -9e because it was
+measured - 6 MB bigger, 7x faster to unpack, and the unpack happens on every stranger's first
+run. Proved on a copy of only that file in an empty folder: it starts (delay-load), unpacks
+345.9 MB in ~4 s behind a progress window, loads the page, and does not unpack again. tray-test
+9/9, mute-check PASS, capability-probe unchanged, GPU still hardware. Memory 493.1 MB against
+v0.1.0's 489.6 over three runs each, inside v0.1.0's own spread, so the payload does not stay
+resident. FINDINGS.md #17 has the numbers and the traps.

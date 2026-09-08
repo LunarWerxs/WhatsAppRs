@@ -10,6 +10,9 @@ paths are script-relative.
 | --- | --- |
 | `build.ps1 [-Check]` | `cargo build --release` plus the cmake/ninja/MSVC environment the `cef` crate's build script needs. First run downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`. |
 | `bundle.ps1 [-KeepFallbacks]` | Assembles the **shippable** folder - not the build directory, which holds .pdb files, headers, import libraries, 220 locales and a 20 MB CREDITS.html - and reports its real size. Then run the bundle, which is the only way to know the trim is honest rather than a list of files someone guessed were unused. |
+| `single-exe.ps1 [-Codec zstd:22]` | Produces the ONE file v0.2.0 ships: runs `bundle.ps1`, compresses the sixteen engine files into a single zstd frame, and writes `whatsapp.exe` + that frame + a 64-byte footer as one executable. Windows ignores bytes past the end of a PE image, so the result is a normal exe that happens to be 129 MB. |
+| `pack-payload.py <bundle> --measure` | The codec comparison behind that choice, re-runnable: size, ratio, pack time and unpack time for zstd 19/22 and xz 6/9 over the real bundle. zstd:22 won on unpack time, not on size. |
+| `single-test.ps1` | The proof for the single exe, and the only one that counts: copies **only** that file into an empty folder, wipes the profile, starts it twice, and checks it starts with no `libcef.dll` beside it, unpacks 17 files, loads the page, and does **not** unpack again on the second start. |
 | `login.ps1` | Opens the app on the persistent profile so a person can scan the QR, and leaves it running. Everything that matters most - memory with a real mailbox, responsiveness with a real chat list, a real call - needs this first. |
 
 ## Measure
@@ -55,6 +58,11 @@ page, prints the answer and stops the app. `-Real` runs it against the logged-in
   `ErrorActionPreference = Stop` that aborts a whole benchmark configuration; without it, the
   call silently returns nothing. It corrupted two runs and blanked three probes before it was
   understood. `Start-Process -WindowStyle Hidden` with redirected files never touches a console.
+- **Piping one of these scripts into `Select-Object -First N` kills it.** PowerShell throws
+  StopUpstreamCommandsException at the producer as soon as N objects have arrived, so everything
+  after the line that produced the Nth object never runs, including the cleanup that stops the
+  app. Five orphaned processes then held `whatsapp.exe` open and the next `cargo build` failed
+  with "Access is denied". Redirect to a file, or use `-Last N`, which has to read to the end.
 - **The single-instance lock is one TCP port**, so an instance still shutting down makes the next
   launch exit 0 - which reads as a crash that succeeded. `Wait-ForExit` is why that stopped
   happening.
