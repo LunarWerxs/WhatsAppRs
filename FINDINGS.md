@@ -615,8 +615,10 @@ libraries, a 20 MB CREDITS.html and 220 locales).
 | Firefox, trimmed | **344.4 MB** | 59 | updater, crash reporter, maintenance service, default-browser agent, gmp-clearkey |
 | (for comparison) the OS-webview build | 36.1 MB profile, ~2 MB exe | | nothing bundled: the engine is already on the machine |
 
-The trimmed Chromium bundle was launched and rendered WhatsApp Web correctly, so the trim is
-measured rather than a list of files that looked unused. The 36 MB fallback set (`vk_swiftshader`,
+**Both trimmed bundles were launched and rendered WhatsApp Web correctly**, so each trim is
+measured rather than a list of files that looked unused. The Firefox bundle runs with its crash
+reporter, updater and maintenance service removed, which is what makes it a shipped engine
+rather than an installed browser. The 36 MB fallback set (`vk_swiftshader`,
 `d3dcompiler_47`, `dxcompiler`, `dxil`, `vulkan-1`) is software rendering and DirectX shader
 compilation; dropping it is fine on this machine and is a real risk on a machine with no working GPU
 driver.
@@ -840,3 +842,59 @@ that works now. None of it exists on the Chromium side.
 better on an empty login page is very likely the one that looks better on a synced mailbox, but
 that has not been measured, and neither has a real call - which is the one place Firefox's
 H.264 could turn from a footnote into the deciding factor. `tools/login.ps1` is there for it.
+
+### 13. The head to head, three runs each, sampled at one minute and four minutes
+
+The definitive table. Same protocol for every row: fresh profile, launch, wait until the page
+reports itself ready, sample the whole process tree at 60 s and 240 s after that, then quit
+cleanly. Three runs each, medians below, and the working-set spread across runs in the last
+column so a difference smaller than the noise is visible as one.
+
+| | processes | ws @60s | private @60s | ws @240s | private @240s | CPU @240s | ready | ws spread |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| **bundled Chromium, `--single-process`** | **1** | **345 MB** | **278 MB** | **352 MB** | **286 MB** | **9 s** | 3.2 s | 346-355 |
+| bundled Chromium, default | 7 | 546 MB | 376 MB | 560 MB | 376 MB | 11 s | 3.3 s | 556-563 |
+| bundled Firefox, trimmed | 10 | 1098 MB | 1023 MB | 1115 MB | 1040 MB | **149 s** | 3.3 s | 1078-1128 |
+| *(control)* the OS webview | 3 | 363 MB | 190 MB | 372 MB | 198 MB | 11 s | 3.3 s | 367-375 |
+
+Three things this adds to the sweep:
+
+- **Memory is flat.** Every configuration grew by under 20 MB between one minute and four.
+  Nothing here is leaking on the login page.
+- **The CPU gap widens with time, and it is enormous.** Over the same four minutes on the same
+  idle page, Firefox burned **149 seconds** of processor against Chromium's 9-11. That is
+  roughly six tenths of a core, continuously, doing nothing visible. The sweep saw 40 s over a
+  45-second window and this confirms it is a rate, not a startup cost. On a laptop that is the
+  battery, and it is the strongest single number in the comparison.
+- **The bundled Chromium in one process is level with the OS webview on working set** (352 vs
+  372 MB) and still 88 MB heavier on private bytes (286 vs 198). Bundling the engine costs
+  about 90 MB of real memory and 325 MB of disk against using the one already installed. That
+  is the whole price of not being Edge.
+
+Startup is now equal at 3.2-3.3 seconds for all four; the 9.8 s figures that appeared twice in
+earlier runs were cold starts, where Windows had to fault in a 272 MB `libcef.dll` that was not
+yet in the file cache. First launch after a reboot will be slower for the Chromium build.
+
+### 14. The product behaviours, verified on both builds
+
+The tray, close-to-tray, single instance and clean shutdown are the reason this app exists
+rather than a bookmark, and neither new engine inherits them for free: one puts CEF's child
+window inside ours, the other puts another *process's* window inside ours. Measured with
+`tools/tray-test.ps1`:
+
+| | bundled Chromium | bundled Firefox |
+| --- | --- | --- |
+| close button hides the window, process survives | PASS | PASS |
+| a second launch exits and raises the first | PASS | PASS |
+| `--quit` shuts down cleanly | PASS | PASS |
+| no orphan browser processes left behind | n/a | PASS (0 left) |
+
+The Firefox row for orphans is the job object doing its job: everything the app spawned is in a
+kill-on-close job, so the browser cannot outlive the host even if the host is killed rather
+than asked.
+
+**One bug was found by writing this test rather than by using the app.** `--quit` was silently
+ignored by three of the four engine backends. They called a `poll_show_request` helper that
+returned only the "show" half of a queued request and **discarded a queued quit**, so every
+restart ended in a process kill - which skips the session flush and is exactly how a WhatsApp
+login gets lost. The helper is deleted; all four backends now read the whole request.

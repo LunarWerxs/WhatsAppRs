@@ -189,3 +189,33 @@ Both bundles are big and within 20 MB of each other: **325 MB** for the trimmed 
 **344 MB** for the trimmed Firefox, against about 2 MB for the OS-webview build that bundles
 nothing. That is the price of the engine being ours rather than the machine's, and it is not
 avoidable by trimming.
+
+### The numbers #15 produced, 2026-09-07
+
+Three runs each, logged out, whole process tree, sampled 60 s and 240 s after the page reported
+itself ready. Method and every other configuration in FINDINGS.md.
+
+| | processes | RAM at 4 min | private | CPU over 4 min | engine on disk |
+| --- | --- | --- | --- | --- | --- |
+| **bundled Chromium, one process** | **1** | **352 MB** | 286 MB | **9 s** | 325 MB |
+| bundled Chromium, default | 7 | 560 MB | 376 MB | 11 s | 325 MB |
+| bundled Firefox, trimmed | 10 | 1115 MB | 1040 MB | **149 s** | 344 MB |
+| *control:* the OS webview (what safe mode runs today) | 3 | 372 MB | 198 MB | 11 s | nothing |
+| *control:* plain Chrome (what the C# app drives) | 10 | 800 MB | 571 MB | 12 s | installed |
+
+The last row reproduces the 802.9 MB measured for the C# wrapper on 2026-09-06 by a different
+script on a different day, to within 2.5 MB, which is the check that the method is sound.
+
+**Chromium wins on memory, on processor, on process count and on architecture.** Firefox has a
+floor around 1.1 GB that six pref configurations could not move, and it spends about six tenths
+of a core continuously on an idle page. Both engines pass close-to-tray, restore and clean quit;
+both render WhatsApp Web correctly from a trimmed shippable bundle.
+
+**Two things remain the owner's call**, and both are recorded here rather than decided:
+
+1. **H.264.** Firefox has it, the public CEF binaries do not, and no switch enables it. It costs
+   a WhatsApp video call that will not negotiate VP8 and it costs uploading an MP4. Fixable only
+   by building CEF from source with proprietary codecs, which is a full Chromium build.
+2. **`--single-process`.** It is what buys 352 MB instead of 560. Chromium does not support it
+   and a renderer crash takes the app down. Nothing measurable breaks, and the WebView2 build
+   already made the same trade.
