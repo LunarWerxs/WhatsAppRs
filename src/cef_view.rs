@@ -22,10 +22,10 @@
 //!    and then `on_context_initialized` - which CEF runs on its own thread - creates the
 //!    browser as a child of that handle.
 
-use crate::{geometry, notify, paths, shortcut, single_instance, tray, APP_ID};
+use crate::{geometry, notify, paths, settings, shortcut, single_instance, tray, APP_ID};
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,21 @@ static PARENT_HWND: AtomicIsize = AtomicIsize::new(0);
 static INIT_W: AtomicI32 = AtomicI32::new(DEFAULT_W as i32);
 static INIT_H: AtomicI32 = AtomicI32::new(DEFAULT_H as i32);
 
+/// The tray toggles, mirrored where CEF's threads can read them. Written on our thread
+/// from the menu; read on the UI thread (`push_mute`) and in the console callback.
+static MUTED: AtomicBool = AtomicBool::new(false);
+static NOTIFICATIONS: AtomicBool = AtomicBool::new(true);
+
+/// The one browser, kept so a menu click on our thread can reach it. A `Browser` may only
+/// be *used* on CEF's UI thread; the menu never uses it, it posts a `UiTask` there, which
+/// is the only reader. The `Send` claim covers exactly that hand-off and nothing else.
+struct UiBrowser(Browser);
+unsafe impl Send for UiBrowser {}
+static BROWSER: Mutex<Option<UiBrowser>> = Mutex::new(None);
+
+/// Where the "About" item points.
+const REPO_URL: &str = "https://github.com/LunarWerxs/WhatsAppRs";
+
 /// Must be the first statement in `main`.
 ///
 /// CEF launches its own child processes by re-executing our executable with a `--type=`
@@ -84,6 +99,11 @@ pub fn intercept() -> bool {
 enum UserEvent {
     TrayClick,
     MenuOpen,
+    MenuReload,
+    MenuMute,
+    MenuNotify,
+    MenuAutostart,
+    MenuAbout,
     MenuQuit,
 }
 
@@ -100,10 +120,20 @@ pub(crate) fn run() -> Result<(), String> {
     let mut store = geometry::Store::new(&data_dir);
     let saved = store.load();
 
+    let prefs = settings::Store::new(&data_dir);
+    let mut current = prefs.load();
+    MUTED.store(current.mute_sounds, Ordering::SeqCst);
+    NOTIFICATIONS.store(current.notifications, Ordering::SeqCst);
+
+    // `--minimized` is what the Startup-folder shortcut passes: sit in the tray at logon
+    // instead of opening the chat window over whatever the user was about to do.
+    let start_hidden = std::env::args().any(|a| a == "--minimized");
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     let mut window_builder = WindowBuilder::new()
         .with_title("WhatsApp")
+        .with_visible(!start_hidden)
         .with_inner_size(LogicalSize::new(DEFAULT_W, DEFAULT_H));
     if let Some(icon) = tray::window_image() {
         window_builder = window_builder.with_window_icon(Some(icon));
@@ -169,7 +199,11 @@ pub(crate) fn run() -> Result<(), String> {
         return Err("cef initialize failed; see cef.log beside the profile".into());
     }
 
-    let tray = tray::build();
+    let tray = tray::build(tray::State {
+        mute_sounds: current.mute_sounds,
+        notifications: current.notifications,
+        autostart: shortcut::autostart_enabled(),
+    });
     {
         let proxy = event_loop.create_proxy();
         tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
@@ -183,16 +217,20 @@ pub(crate) fn run() -> Result<(), String> {
             }
         }));
     }
-    if let Some(t) = &tray {
+    if tray.is_some() {
         let proxy = event_loop.create_proxy();
-        let open_id = t.open_id.clone();
-        let quit_id = t.quit_id.clone();
         muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
-            if event.id == open_id {
-                let _ = proxy.send_event(UserEvent::MenuOpen);
-            } else if event.id == quit_id {
-                let _ = proxy.send_event(UserEvent::MenuQuit);
-            }
+            let ev = match event.id.as_ref() {
+                tray::OPEN_ID => UserEvent::MenuOpen,
+                tray::RELOAD_ID => UserEvent::MenuReload,
+                tray::MUTE_ID => UserEvent::MenuMute,
+                tray::NOTIFY_ID => UserEvent::MenuNotify,
+                tray::AUTOSTART_ID => UserEvent::MenuAutostart,
+                tray::ABOUT_ID => UserEvent::MenuAbout,
+                tray::QUIT_ID => UserEvent::MenuQuit,
+                _ => return,
+            };
+            let _ = proxy.send_event(ev);
         }));
     }
 
@@ -230,6 +268,35 @@ pub(crate) fn run() -> Result<(), String> {
 
             Event::UserEvent(UserEvent::TrayClick) => toggle(&window, &mut store),
             Event::UserEvent(UserEvent::MenuOpen) => show(&window),
+            Event::UserEvent(UserEvent::MenuReload) => post_ui(UiJob::Reload),
+            Event::UserEvent(UserEvent::MenuMute) => {
+                current.mute_sounds = !current.mute_sounds;
+                MUTED.store(current.mute_sounds, Ordering::SeqCst);
+                prefs.save(current);
+                if let Some(t) = &tray {
+                    t.set_mute(current.mute_sounds);
+                }
+                post_ui(UiJob::Mute(current.mute_sounds));
+            }
+            Event::UserEvent(UserEvent::MenuNotify) => {
+                current.notifications = !current.notifications;
+                NOTIFICATIONS.store(current.notifications, Ordering::SeqCst);
+                prefs.save(current);
+                if let Some(t) = &tray {
+                    t.set_notifications(current.notifications);
+                }
+            }
+            Event::UserEvent(UserEvent::MenuAutostart) => {
+                let want = !shortcut::autostart_enabled();
+                if let Err(e) = shortcut::set_autostart(want, APP_ID) {
+                    eprintln!("[whatsapp-rs] autostart: {e}");
+                }
+                // The Startup file is the truth; the check mark follows it, not the click.
+                if let Some(t) = &tray {
+                    t.set_autostart(shortcut::autostart_enabled());
+                }
+            }
+            Event::UserEvent(UserEvent::MenuAbout) => open_url(REPO_URL),
             Event::UserEvent(UserEvent::MenuQuit) => {
                 record_geometry(&window, &mut store);
                 *control_flow = ControlFlow::Exit;
@@ -345,6 +412,78 @@ fn resize_browser(w: i32, h: i32) {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOZORDER};
         let _ = SetWindowPos(HWND(hwnd as _), None, 0, 0, w, h, SWP_NOZORDER);
+    }
+}
+
+/// Work for CEF's UI thread, posted from ours. Everything that touches the `Browser` goes
+/// through here; calling it from the tao thread is the access violation described at
+/// `PARENT_HWND`.
+#[derive(Clone)]
+enum UiJob {
+    Reload,
+    Mute(bool),
+}
+
+fn post_ui(job: UiJob) {
+    let mut task = UiTask::new(job);
+    if post_task(ThreadId::UI, Some(&mut task)) != 1 {
+        eprintln!("[whatsapp-rs] post_task to the UI thread failed");
+    }
+}
+
+wrap_task! {
+    struct UiTask {
+        job: UiJob,
+    }
+
+    impl Task {
+        fn execute(&self) {
+            let Ok(slot) = BROWSER.lock() else { return };
+            let Some(UiBrowser(browser)) = slot.as_ref() else { return };
+            match self.job {
+                UiJob::Reload => browser.reload(),
+                UiJob::Mute(on) => push_mute(browser, on),
+            }
+        }
+    }
+}
+
+/// Tell the page whether to keep its chime down. UI thread only.
+///
+/// This is page-side on purpose. `BrowserHost::set_audio_muted` would do it in one call
+/// and would also silence a voice call, which is the opposite of what "mute
+/// notifications" means. The shim (`NOTIFY_SHIM_JS`) mutes only the short alert sounds.
+fn push_mute(browser: &Browser, on: bool) {
+    let Some(frame) = browser.main_frame() else { return };
+    let js = format!("if (window.__waRsSetMute) window.__waRsSetMute({on});");
+    frame.execute_java_script(
+        Some(&CefString::from(js.as_str())),
+        Some(&CefString::from("whatsapp-rs://mute")),
+        0,
+    );
+}
+
+/// Hand a URL to the default browser. ShellExecute, not `cmd /c start`: the latter
+/// flashes a console window, which this app never shows.
+fn open_url(url: &str) {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let url_w: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        ShellExecuteW(
+            None,
+            w!("open"),
+            PCWSTR(url_w.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     }
 }
 
@@ -598,6 +737,37 @@ const NOTIFY_SHIM_JS: &str = r#"
       install();
     });
   } catch (e) {}
+  // ---- "Mute sounds", the tray toggle. ----
+  // Read from the bundles the page actually loaded (tools/script-grep.py, 2026-09-08):
+  // every alert is a module-level `new window.Audio(<static asset URL>)` - the message
+  // chime (WAWebNotificationTone), the sent tone (WAWebOutgoingMessageTone), the voice-
+  // note start/end beeps (WAWebPttPlaybackTone), the call-end tone (WAWebCallEndTone) and
+  // the ringtone. Voice messages are end-to-end encrypted and so are always decrypted in
+  // the page and played from blob: URLs, and a call's remote audio arrives as a
+  // MediaStream through srcObject. "A detached media element playing a plain https
+  // source" is therefore exactly the set of tones and nothing else, which is why muting
+  // is done here and not with the engine's whole-page audio mute.
+  window.__waRsMuted = !!window.__waRsMuted;
+  window.__waRsSetMute = function (on) { window.__waRsMuted = !!on; };
+  try {
+    var mproto = window.HTMLMediaElement && HTMLMediaElement.prototype;
+    if (mproto && !mproto.__waRsMutePatched) {
+      var realPlay = mproto.play;
+      mproto.play = function () {
+        try {
+          var src = this.currentSrc || this.src || '';
+          var tone = !this.isConnected && !this.srcObject && /^https?:/.test(src);
+          if (tone) {
+            if (window.__waRsMuted) { this.muted = true; this.__waRsForced = true; }
+            else if (this.__waRsForced) { this.muted = false; this.__waRsForced = false; }
+          }
+        } catch (e) {}
+        return realPlay.apply(this, arguments);
+      };
+      mproto.__waRsMutePatched = true;
+    }
+  } catch (e) {}
+
   try { console.log('WHATSAPP_RS_SHIM installed=' + ok); } catch (e) {}
 
 })();
@@ -704,6 +874,10 @@ wrap_client! {
             Some(HostDisplay::new())
         }
 
+        fn load_handler(&self) -> Option<LoadHandler> {
+            Some(HostLoad::new())
+        }
+
         /// Without this, a permission request in Alloy style is silently ignored and in
         /// Chrome style raises a prompt inside a window that has no browser UI to show
         /// it in. Either way the page never gets an answer.
@@ -725,6 +899,9 @@ wrap_life_span_handler! {
                     let hwnd = host.window_handle();
                     BROWSER_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
                 }
+                if let Ok(mut slot) = BROWSER.lock() {
+                    *slot = Some(UiBrowser(browser.clone()));
+                }
             }
             if let Ok(mut state) = self.inner.lock() {
                 state.browsers += 1;
@@ -735,7 +912,33 @@ wrap_life_span_handler! {
             if let Ok(mut state) = self.inner.lock() {
                 state.browsers = state.browsers.saturating_sub(1);
             }
+            if let Ok(mut slot) = BROWSER.lock() {
+                *slot = None;
+            }
             BROWSER_HWND.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
+wrap_load_handler! {
+    struct HostLoad;
+
+    impl LoadHandler {
+        /// Every load, including WhatsApp's own reloads, starts with a page that knows
+        /// nothing about the mute toggle. Re-tell it once the main frame is up.
+        fn on_load_end(
+            &self,
+            browser: Option<&mut Browser>,
+            frame: Option<&mut Frame>,
+            _http_status_code: ::std::os::raw::c_int,
+        ) {
+            let (Some(browser), Some(frame)) = (browser, frame) else {
+                return;
+            };
+            if frame.is_main() == 0 {
+                return;
+            }
+            push_mute(browser, MUTED.load(Ordering::SeqCst));
         }
     }
 }
@@ -759,7 +962,11 @@ wrap_display_handler! {
             // The notification bridge's return path. See NOTIFY_SHIM_JS for why the
             // console is the channel.
             if let Some(payload) = text.strip_prefix(NOTIFY_TAG) {
-                raise_toast(payload);
+                // "Show notifications" off: the page still believes it notified, which
+                // keeps its own unread logic intact; we simply draw nothing.
+                if NOTIFICATIONS.load(Ordering::SeqCst) {
+                    raise_toast(payload);
+                }
                 return 1;
             }
 

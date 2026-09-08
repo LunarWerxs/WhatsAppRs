@@ -34,6 +34,8 @@ page, prints the answer and stops the app. `-Real` runs it against the logged-in
 | `page-state.js` | What the page currently is - `qr`, `syncing`, `chats` - plus row count, JS heap and which browser it thinks it is. This is what makes "60 seconds after ready" mean the same thing across runs. |
 | `frames.js` | Frame timing, and it **scrolls the chat list while measuring**. An idle page paints nothing and reports the monitor's refresh rate, which measures nothing. Logged out it says `driven: false`; treat those numbers as meaningless. |
 | `shim-check.js` | Whether the notification shim reached the page, and whether `Notification` is the engine's or ours. Written because the shim demonstrably ran while the constructor it was supposed to replace was still native. |
+| `mute-check.js` | Whether the tray's "Mute sounds" reaches the page and mutes **only** the alert tones: a detached element on an https source is muted while the toggle is on, an element in the document and a blob-backed one are never touched. Seed the probe profile's `settings.txt` with `mute_sounds=1` first and it also proves the host pushed the state at load. |
+| `script-grep.py PORT REGEX` | Grep the JavaScript the page actually loaded, through the debugger. The bundles are cross-origin so the page cannot read them, but `Debugger.getScriptSource` can. This is how the mute rule was derived: every WhatsApp alert is a module-level `new window.Audio(<static asset>)`, voice messages play from blobs, calls from a MediaStream. |
 
 ## Notifications and product behaviour
 

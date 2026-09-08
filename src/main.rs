@@ -29,6 +29,7 @@ mod cef_view;
 mod geometry;
 mod notify;
 mod paths;
+mod settings;
 mod shortcut;
 mod single_instance;
 mod tray;

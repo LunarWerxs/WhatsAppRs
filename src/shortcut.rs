@@ -40,6 +40,34 @@ pub fn ensure(_app_id: &'static str) -> Result<Outcome, String> {
     Err("no Start Menu shortcut on this platform".into())
 }
 
+/// Is there a shortcut in the user's Startup folder? That file IS the setting: Windows
+/// runs whatever is in there at logon, so there is nothing else to consult.
+#[cfg(target_os = "windows")]
+pub fn autostart_enabled() -> bool {
+    windows_impl::startup_link_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Write or remove the Startup-folder shortcut. The shortcut launches with `--minimized`,
+/// so a logon does not open the chat window over whatever the user was about to do.
+#[cfg(target_os = "windows")]
+pub fn set_autostart(on: bool, app_id: &'static str) -> Result<(), String> {
+    std::thread::spawn(move || windows_impl::set_autostart(on, app_id))
+        .join()
+        .map_err(|_| "shortcut thread panicked".to_string())?
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn autostart_enabled() -> bool {
+    false
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_autostart(_on: bool, _app_id: &'static str) -> Result<(), String> {
+    Err("no Startup folder on this platform".into())
+}
+
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::{Outcome, LINK_NAME};
@@ -63,14 +91,22 @@ mod windows_impl {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    fn link_path() -> Result<PathBuf, String> {
+    fn programs_dir() -> Result<PathBuf, String> {
         let appdata = std::env::var_os("APPDATA").ok_or("APPDATA is not set")?;
         Ok(PathBuf::from(appdata)
             .join("Microsoft")
             .join("Windows")
             .join("Start Menu")
-            .join("Programs")
-            .join(LINK_NAME))
+            .join("Programs"))
+    }
+
+    fn link_path() -> Result<PathBuf, String> {
+        Ok(programs_dir()?.join(LINK_NAME))
+    }
+
+    /// The per-user Startup folder. Everything in it runs at logon.
+    pub fn startup_link_path() -> Result<PathBuf, String> {
+        Ok(programs_dir()?.join("Startup").join(LINK_NAME))
     }
 
     pub fn ensure(app_id: &str) -> Result<Outcome, String> {
@@ -85,9 +121,29 @@ mod windows_impl {
             if link.exists() && matches!(is_current(&link, &exe, app_id), Ok(true)) {
                 return Ok(Outcome::Current);
             }
-            write(&link, &exe, app_id)?;
+            write(&link, &exe, "", app_id)?;
             Ok(Outcome::Written)
         })();
+        unsafe { CoUninitialize() };
+        result
+    }
+
+    pub fn set_autostart(on: bool, app_id: &str) -> Result<(), String> {
+        let link = startup_link_path()?;
+        if !on {
+            return match std::fs::remove_file(&link) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("remove {}: {e}", link.display())),
+            };
+        }
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if hr.is_err() {
+            return Err(format!("CoInitializeEx: {hr}"));
+        }
+        // Rewritten every time it is switched on, so a moved executable is picked up.
+        let result = write(&link, &exe, "--minimized", app_id);
         unsafe { CoUninitialize() };
         result
     }
@@ -125,12 +181,13 @@ mod windows_impl {
         Ok(stored == app_id)
     }
 
-    fn write(link: &Path, exe: &Path, app_id: &str) -> Result<(), String> {
+    fn write(link: &Path, exe: &Path, args: &str, app_id: &str) -> Result<(), String> {
         if let Some(dir) = link.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         let shell_link = new_link()?;
         let exe_w = wide(&exe.to_string_lossy());
+        let args_w = wide(args);
         let dir_w = wide(
             &exe.parent()
                 .map(|p| p.to_string_lossy().into_owned())
@@ -141,6 +198,9 @@ mod windows_impl {
             shell_link
                 .SetPath(PCWSTR(exe_w.as_ptr()))
                 .map_err(|e| format!("SetPath: {e}"))?;
+            shell_link
+                .SetArguments(PCWSTR(args_w.as_ptr()))
+                .map_err(|e| format!("SetArguments: {e}"))?;
             shell_link
                 .SetWorkingDirectory(PCWSTR(dir_w.as_ptr()))
                 .map_err(|e| format!("SetWorkingDirectory: {e}"))?;

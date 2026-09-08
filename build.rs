@@ -19,6 +19,16 @@ fn main() {
         // the supported-OS list, run as the invoking user.
         embed_manifest(new_manifest("Lunarwerx.WhatsAppRs"))
             .expect("failed to embed the Windows manifest");
+
+        // The icon Explorer, the taskbar and the Start Menu show, plus the version block
+        // in the file's Properties. Both come from a compiled .rc, so this needs rc.exe.
+        let mut res = winresource::WindowsResource::new();
+        res.set_icon("assets/icon.ico");
+        res.set("ProductName", "WhatsApp Rs");
+        res.set("FileDescription", "WhatsApp Web as a small tray app");
+        res.set("LegalCopyright", "MIT License");
+        res.compile().expect("failed to compile the Windows resource (is rc.exe on PATH?)");
     }
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
 }

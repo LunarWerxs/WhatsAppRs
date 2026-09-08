@@ -195,7 +195,7 @@ The reporter's account was **already suspended and under repeated appeal** befor
 the picture. An already-flagged account being re-flagged is the far better explanation. Recorded here
 for completeness, but it should not be read as evidence that wrappers carry ban risk. They do not.
 
-The full reasoning is in ARCHITECTURE_DECISION.md under the CORRECTION heading.
+The full reasoning was in ARCHITECTURE_DECISION.md, deleted on 2026-09-08 with the rest of the multi-engine era; `git log` has it.
 
 ## Honest note on the research
 
@@ -206,7 +206,7 @@ item counts for the second run. **The probe, not the research, is what this docu
 ## Reproducing any of this
 
 - Windows: `cargo build`, run the exe, read `probe-report.jsonl`.
-- Linux: `docker build -f Dockerfile.linux-probe -t whatsapp-linux-probe . && docker run --rm whatsapp-linux-probe`.
+- Linux: the WebKitGTK probe (`Dockerfile.linux-probe`) went with the OS-webview build; `git log` has it.
 - The RAM and disk comparison is `headtohead.ps1` in the session scratchpad.
 
 ## Toasts on Windows, measured 2026-09-07
@@ -1013,3 +1013,57 @@ permission granted.
 
 Against what it replaces, all by the same method: **490 MB against Meta's 1110 MB and plain
 Chrome's 800 MB**, in 5 processes against 8 and 10.
+
+## 16. The public build: icon, tray menu, mute (2026-09-08)
+
+The owner ran the bundle on his real account and reported about 893 MB, which is the same
+ratio to the logged-out 490 MB that Meta's own app shows between its states; a real mailbox is
+most of the cost and it is WhatsApp's, not the wrapper's. He asked for a public release, an
+executable icon, and a tray menu with at least a mute that keeps the toasts and drops the sound.
+
+**How WhatsApp makes noise, read from the bundles it actually loaded** (`tools/script-grep.py`
+over `Debugger.getScriptSource`, because the bundles are cross-origin and the page cannot read
+them): every alert is a module-level `new window.Audio(<static asset URL>)` played from a
+function - `WAWebNotificationTone` (the message chime), `WAWebOutgoingMessageTone`,
+`WAWebPttPlaybackTone` (the voice-note start and end beeps), `WAWebCallEndTone`, and the ringtone
+(`new window.Audio(getRingtoneURL())` with `loop = true`). Voice messages are end-to-end
+encrypted, so they are decrypted in the page and always play from `blob:` URLs; a call's remote
+audio arrives as a MediaStream through `srcObject`. So **"a detached media element playing a
+plain https source" is exactly the set of tones and nothing else.**
+
+That is the mute rule, and it is why the engine's `set_audio_muted` was not used: it silences the
+whole page, calls included, which is the opposite of what "mute notifications" means. The shim
+patches `HTMLMediaElement.prototype.play`, sets `muted` on a tone while the toggle is on and
+clears it again on the next play once it is off. The host pushes the state on every main-frame
+load (`LoadHandler::on_load_end`) and on every toggle, through a task posted to CEF's UI thread;
+the `Browser` object is only ever touched there.
+
+`tools/mute-check.js` against the shipped build, with the probe profile pre-seeded to
+`mute_sounds=1`:
+
+```
+set_mute_fn=function patched=true pushed_at_load=true
+on:  tone=true  inDom=false blob=false
+off: tone=false inDom=false blob=false
+verdict PASS
+```
+
+The Windows toast itself was already silent: notify-rust passes no sound name, and the WinRT
+toast then carries `<audio silent="true"/>`. Every sound the owner heard was the page's.
+
+**The rest of the menu**: Reload; Show notifications (the toast is simply not drawn - the page
+still believes it notified, so its unread logic is untouched); Start with Windows (a shortcut in
+the user's Startup folder, written with `--minimized` so a logon starts in the tray; the file's
+existence IS the setting, nothing is stored beside it); About (opens the repository through
+`ShellExecuteW`, not `cmd /c start`, which flashes a console). The two toggles persist as two
+`key=value` lines in `settings.txt`, the same shape as the window geometry file.
+
+**The icon** is compiled in with `winresource` from `assets/icon.ico`, along with a version block
+(`ProductName`, `FileDescription`, `FileVersion 0.1.0`). Verified: Explorer's associated-icon
+call returns 32x32 from the exe, and `VersionInfo` reads back the four fields.
+
+`tools/tray-test.ps1` on the new build: close-to-tray PASS, restore PASS, clean quit PASS.
+
+**The release**: `bundle.ps1 -KeepFallbacks` - 346.9 MB in 17 files, the software-rendering
+fallback kept this time because a public build meets machines without a working GPU driver -
+zipped to 164.7 MB, SHA-256 `8F6BBF6F…C71713`, published as v0.1.0.

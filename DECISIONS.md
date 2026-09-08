@@ -117,7 +117,7 @@ nine upstreamable patches and every measurement stay in the tree; nothing is del
 
 **14. Light mode is retired (2026-09-07).** His words: "we'll ditch the WhatsApp, like, Rust bannable
 engine as well, 'cause I don't really care about that." This is the native-protocol client from #8's
-era: ~20 MB, and a permanent ban risk (see the ban rule at the top of HANDOFF.md). He was never going
+era: ~20 MB, and a permanent ban risk (the ban risk is spelled out in #19). He was never going
 to run it on his own number and would not get a spare one, so it existed only for other people.
 Consequence: the code and its WhatsApp-styled window stay, unmaintained; the first-run picker that
 chose between safe and light mode loses its reason to exist.
@@ -260,3 +260,28 @@ permanent ban risk, because pulling the protocol out of their app is the clause 
 forbid. It was built, measured, and retired in #14 for that reason. The choice has always been
 those two things and nothing in between: speak their protocol at 20 MB with a ban risk, or
 render their website at 350-560 MB with none.
+
+**20. Public, MIT, with a build anyone can run (2026-09-08).** His words after running it on his
+own account: "893 megs. I like it. Let's get this into a public repo or whatever, push a build so
+other people can use it, and make sure the executable has an icon." The repository is
+`LunarWerxs/WhatsAppRs`, public, MIT (the licence every other public LunarWerx repo uses), with
+the trimmed bundle attached to a GitHub release as a zip. The public zip keeps the
+software-rendering fallback (+37 MB on disk, no RAM cost) because strangers' machines have GPU
+drivers ours does not. Everything from the multi-engine era that no longer described the code -
+the handoff, the architecture memo, the Linux WebKitGTK probe - was deleted rather than shipped
+stale; the Servo build notes moved beside the Servo patches they belong to.
+
+**21. "Mute" means the sound and only the sound (2026-09-08).** His words: "at least a mute
+notifications option. Specifically mutes, not, like, stop the notifications, just make it so
+there's no sound." So the tray has two separate toggles: **Mute sounds** silences WhatsApp's alert
+tones and leaves toasts, voice messages and calls alone; **Show notifications** is the other
+thing, off by choice only. The engine's whole-page audio mute was rejected because it would have
+silenced a call. Beyond those, the menu carries what a public build needs and nothing more:
+Reload, Start with Windows, About, Quit.
+
+**22. The Servo bug report goes in, under this project's name, disclosed as AI-written
+(2026-09-08).** After being told their contributor guide bans LLM-written contributions: "Just
+open an issue then if their no LLM policy is written, which is some bullshit... Feel free to let
+them know that the issue was opened by an AI." The issue is a bug report, not code; it says at the
+top what wrote it; the patches stay on the LunarWerxs fork as reference and are not offered as
+pull requests. Their policy, their call; the disclosure is so they can apply it.

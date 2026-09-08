@@ -54,6 +54,9 @@ features = [
 # Embeds the Windows manifest: common controls v6 and per-monitor DPI awareness. See build.rs.
 [target.'cfg(target_os = "windows")'.build-dependencies]
 embed-manifest = "1.5.0"
+# The executable's icon and version block. Needs rc.exe from the Windows SDK, which
+# tools/build.ps1 puts on PATH along with the rest of the MSVC environment.
+winresource = "0.1"
 
 [profile.release]
 # opt-level "z" and whole-program LTO buy nothing here and cost minutes: almost all the code in
