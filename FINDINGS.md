@@ -495,3 +495,324 @@ One instrument lesson: UI Automation's `SelectionItem.Select()` on a list box se
 without the `LBN_SELCHANGE` a mouse click sends, so the app never saw it and the typed text went to
 the list box's type-ahead until the letter m jumped it to "Mum". A real click (`mouse_event`)
 reproduces what a person does; the driver now clicks.
+
+---
+
+# Bundled Chromium vs bundled Firefox, 2026-09-07
+
+The head-to-head DECISIONS.md #15 asked for. Both are built, both run, both were measured on this
+machine with the same instruments (`tools/engine-bench.ps1`, `tools/bench-summary.py`). Servo and
+light mode are untouched and unmentioned below; they are retired.
+
+## What each one IS, because the two are not the same kind of thing
+
+**Chromium is embedded.** The `cef` crate (Chromium Embedded Framework, 152.0.0+152.0.5, tracking
+Chromium 152.0.7977.54) links into our process, and the browser is created as a child window of the
+window we already own. `src/cef_view.rs`. Everything the current design owns - tray, close to tray,
+single instance, window geometry - carries over unchanged, because the arrangement is exactly what
+WebView2 was: our window, someone else's renderer inside it.
+
+**Firefox is driven.** Gecko has no embedding API, so a Firefox build means shipping a real Firefox
+and adopting its window with `SetParent`. `src/firefox_view.rs`. That was the risk flagged in the
+brief, and the first thing measured. **It works.** The Firefox window becomes a child of ours,
+survives being reparented, resizes with us, hides to the tray with us, and keeps rendering: a
+screenshot taken during the test shows WhatsApp Web inside a window whose title bar and border
+are ours. (`tools/engine-drive.ps1 -Engine firefox` reproduces it; screenshots are gitignored.)
+It is still a hack, and it brings back three things the current design had deleted:
+
+- finding another process's window (the C# original's `WindowFinder`),
+- making two processes die together (a job object with kill-on-close, so a crashed host cannot leave
+  an orphan browser holding the profile lock),
+- forwarding focus by hand, because activating our window does not give an adopted child keyboard
+  focus and typing goes nowhere after a restore from tray.
+
+None of those is hard. They are all in `firefox_view.rs` and they all work. The point is that they
+exist at all: the Chromium build needs none of them.
+
+## The findings that decide it, in the order they matter
+
+### 1. Codecs: Firefox has H.264, our bundled Chromium does not
+
+Measured with `tools/webrtc-probe.js` inside the real `web.whatsapp.com` page, on both builds:
+
+| | RTCPeerConnection | ICE candidates | microphone | audio codecs | video codecs |
+| --- | --- | --- | --- | --- | --- |
+| bundled Chromium (CEF 152) | yes | 3 (host, srflx) | granted, real device | Opus, G722, PCMU, PCMA, CN, telephone-event | VP8, VP9, AV1, rtx, red, ulpfec |
+| bundled Firefox 155.0.1 | yes | 13 (host, srflx) | granted, real device | Opus, G722, PCMU, PCMA, telephone-event | VP8, VP9, **H264**, AV1, ulpfec, red |
+
+Both can do a call; Servo never could, which was one of the reasons it was retired. The difference
+is **H.264**, and it is not a setting. The official CEF binary distributions on
+`cef-builds.spotifycdn.com` are compiled without proprietary codecs, so there is no flag that turns
+it on: getting H.264 into the Chromium build means building CEF from source with
+`proprietary_codecs=true ffmpeg_branding=Chrome`, which is a full Chromium checkout and build.
+
+Audio calls use Opus and both have it. Video is where this bites, and how hard it bites depends on
+whether WhatsApp Web negotiates VP8 with phones or insists on H.264 - which needs a real call on a
+linked account to answer, and is the single most useful thing to test next. Nobody has published an
+answer: a search of Meta's own engineering posts, WhatsApp's blog, Bugzilla and Chromium's tracker
+turns up no statement of which video codecs WhatsApp Web negotiates. (WhatsApp Web calling itself
+only launched on 2026-07-28, which is part of why.)
+
+**There is a second, already-documented consequence that does not depend on calls at all.** Other
+people embedding CEF have hit exactly this against WhatsApp: without proprietary codecs, **uploading
+an MP4 to WhatsApp fails** with "video not supported", because the page decodes the file locally
+before sending it. That is a plain feature loss in the Chromium build, on a path a person uses far
+more often than a video call, and it is the same single cause.
+
+### 2. Firefox's permission prompts live in the browser UI we deleted
+
+Found by measurement, not by reading: the first WebRTC probe on Firefox came back
+`mic: "timed out waiting for the permission answer"`. Firefox asks for the microphone with a
+doorhanger anchored to the URL bar, and the URL bar is exactly what `userChrome.css` collapses to
+make the window look like an app. The prompt is raised into a bar that is not on screen, so nobody
+can ever answer it, and a voice call would hang with no visible cause.
+
+Fixed by pre-granting in the profile the app writes (`permissions.default.microphone`,
+`permissions.default.camera`, `permissions.default.desktop-notification`,
+`media.navigator.permission.disabled`), after which the same probe reports `mic: "granted"` with the
+real device name. Worth stating plainly: these are `default` grants, i.e. every site, and they are
+only acceptable because this profile is ours and the app opens exactly one URL.
+
+The Chromium build has the same problem in principle and a better answer: CEF hands permission
+requests to the host (`CefPermissionHandler::OnShowPermissionPrompt`), so `cef_view.rs` answers them
+in code - accept for `web.whatsapp.com`, deny for anything else - with no UI involved at all.
+
+### 3. CEF's Chrome runtime style crashes with a native child window
+
+CEF 152 has two runtime styles. Chrome style is the one carrying Chromium's own notification and
+permission machinery, so it was the obvious choice. **With a browser created as a child of a native
+window it dies with an access violation (0xC0000005) immediately after `create_browser` returns 1**,
+twice out of two, with nothing in `cef.log`. The identical build under Alloy style runs. Chrome
+style wants CEF's own Views window, which is not a window we own, and owning the window is the whole
+design.
+
+So the build is Alloy, and Alloy's cost is that its default answer to a permission prompt is
+*ignore*: notifications are silently dead unless the host answers. That is what the permission
+handler and the `SetContentSetting` call in `cef_view.rs` exist for.
+
+### 4. Firefox removed the Chrome DevTools Protocol in 141
+
+`--remote-debugging-port` still exists on Firefox 155 and now speaks **WebDriver BiDi**, not CDP,
+and the `remote.active-protocols` pref that used to switch between them is gone. A CDP client
+against it fails in a way that reads like a broken browser. `tools/bidi-eval.py` is the client for
+Firefox; `tools/cdp-eval.py` remains the one for Chromium. Both must suppress the `Origin` header -
+Firefox answers 400 and Chromium answers 403 to a websocket that carries one - and Firefox allows a
+single BiDi session that it does not free the instant the socket closes, so a client that does not
+call `session.end` breaks the next probe.
+
+### 5. Disk: they are within 20 MB of each other, and both are ~10x the OS webview build
+
+Measured by assembling the actual shippable folder with `tools/bundle.ps1` and then running the app
+out of it, rather than by reading the build directory (which holds .pdb files, headers, import
+libraries, a 20 MB CREDITS.html and 220 locales).
+
+| bundle | size | files | what was dropped |
+| --- | --- | --- | --- |
+| Chromium, trimmed | **325.5 MB** | 11 | 219 locales, software-GL and DirectX-shader fallbacks, CREDITS.html, headers, .pdb |
+| Chromium, with GPU fallbacks kept | 362.1 MB | 17 | as above, minus the fallbacks |
+| Firefox, trimmed | **344.4 MB** | 59 | updater, crash reporter, maintenance service, default-browser agent, gmp-clearkey |
+| (for comparison) the OS-webview build | 36.1 MB profile, ~2 MB exe | | nothing bundled: the engine is already on the machine |
+
+The trimmed Chromium bundle was launched and rendered WhatsApp Web correctly, so the trim is
+measured rather than a list of files that looked unused. The 36 MB fallback set (`vk_swiftshader`,
+`d3dcompiler_47`, `dxcompiler`, `dxil`, `vulkan-1`) is software rendering and DirectX shader
+compilation; dropping it is fine on this machine and is a real risk on a machine with no working GPU
+driver.
+
+Neither of these is small. That is what "bundle the engine" costs, and it is the honest price of
+not being Edge.
+
+### 6. What is NOT yet known, and needs the owner's account
+
+Everything above was measured on a logged-out window, because a logged-out window is
+repeatable and cannot cost a login. Three things cannot be answered that way, and all three
+are things that would change the answer:
+
+- **Memory with a real mailbox.** WhatsApp Web's footprint is mostly the synced account. The
+  Chrome wrapper's 803 MB and Servo's 1.2 GB were both measured on the owner's real account;
+  the numbers here are not comparable to those until the same is done for these two.
+- **Responsiveness.** `frames.js` reports about 120 fps for both engines on the login page,
+  which is the monitor's refresh rate and means nothing: there is nothing to paint. The probe
+  scrolls the chat list on purpose, and there is no chat list until someone logs in.
+- **A real call.** Both engines can gather ICE candidates and open the microphone. Whether a
+  WhatsApp call actually connects, and which codec it settles on, is a question only a real
+  call answers.
+
+`tools/login.ps1 -Engine cef` and `tools/login.ps1 -Engine firefox` open each build on its own
+persistent profile for a QR scan; each engine keeps its own login and neither touches the
+Servo profile. After that, `tools/engine-bench.ps1 -Engine X -Runs 3 -Real` is the same
+protocol against the real account.
+
+### Method, and why two memory numbers are reported instead of one
+
+Every figure below is the sum over the whole process tree, sampled a fixed time after the
+PAGE reported itself ready rather than a fixed time after launch, because the two engines
+reach a drawn page at different speeds and "60 seconds after start" would be comparing two
+different moments.
+
+**Working set** is what Task Manager shows and what every earlier number in this document
+used, so it is the one that compares to the 803 MB Chrome wrapper and the 1.2 GB Servo build.
+It counts a page of memory once per process that has it mapped, so it flatters an engine with
+few processes and punishes one with many.
+
+**Private bytes** is what each process cannot share with anything else. It is the honest
+answer to "how much of this machine's memory does this app actually consume", and it is
+reported beside the working set for every configuration. Where the two disagree, believe the
+private number.
+
+**CPU seconds** is cumulative processor time across the tree at the sample point. It answers
+what neither memory number can: how much work the engine did to put the same page on screen.
+On a 32-core machine an engine can be busy without ever feeling slow, and this is the only
+figure in the run that notices.
+
+### 7. Notifications: Firefox does it by itself, Chromium does not and needs the host
+
+Tested with `tools/notify-test.ps1`, which reads **Windows' own notification database** rather
+than believing the page. That distinction is the whole reason this was re-tested: on the
+WebView2 round the page reported `onshow` and `getNotifications()` said "displayed" while
+Windows had recorded nothing and no toast had appeared.
+
+| | what the page reported | what Windows recorded |
+| --- | --- | --- |
+| bundled Chromium, host bridge OFF | `onshow` fired, service worker resolved, permission `granted` | **nothing** |
+| bundled Chromium, host bridge ON | identical | **two toasts under `com.lunarwerx.whatsapp-rs`** |
+| bundled Firefox | identical | **one toast under `FirefoxPortableToast-45C7D66DB3C307DD`** |
+
+So the page's report is once again worth nothing, and the two engines differ:
+
+- **Firefox raises a real Windows toast with no host code at all.** It registers its own COM
+  notification server and files the toast under an identity derived from the install path.
+  That is a genuine advantage - and the identity is Firefox's, not ours, so the toast is not
+  branded as the app without further work.
+- **CEF displays nothing.** Alloy style turns Blink's notification support off outright, and
+  CEF exposes no callback that hands a notification's title and body to the host: `CefClient`
+  declares eighteen handler factories and none of them is about notifications. So `cef_view.rs`
+  bridges it: a script injected in the render process at document start replaces
+  `window.Notification` and `ServiceWorkerRegistration.prototype.showNotification`, and the
+  host raises the toast itself under the AppUserModelID that `shortcut.rs` registers - the
+  same path the WebView2 build already needed.
+
+Two things that only came out by measuring the shim rather than trusting it:
+
+- **A plain `window.Notification = Shim` does not stick.** The shim demonstrably ran (its
+  marker was on the page) and `Notification` was still the engine's own constructor
+  afterwards. `Object.defineProperty` plus a re-check works, and the shim now logs
+  `WHATSAPP_RS_SHIM installed=true` so a future failure is visible instead of silent.
+- **Something on the page replaces it again after document start.** The re-check fires on
+  every load: `WHATSAPP_RS_SHIM reinstalling, something replaced Notification`. Without the
+  second install the bridge would have worked in a test and failed in the product.
+
+### 8. `--single-process` on Chromium: 352 MB, one process, and nothing measurably broken
+
+Chromium's `--single-process` is officially unsupported and puts the renderer in the browser
+process, so a renderer crash takes the app down instead of showing a sad tab. The WebView2
+build already accepted that trade. Measured on CEF it is worth more than it was there:
+
+| | processes | working set | private | CPU to first paint |
+| --- | --- | --- | --- | --- |
+| bundled Chromium, default | 7 | 548 MB | 385 MB | 7 s |
+| bundled Chromium, `--single-process` | **1** | **352 MB** | **294 MB** | 6 s |
+
+Before trusting it, `tools/capability-probe.js` asked the page what it still had. Everything:
+service worker **registered and controlling**, IndexedDB, SubtleCrypto, WebAssembly,
+SharedWorker, Web Locks, OPFS, mediaDevices, WebRTC, WebGL, and the notification permission
+reading `granted`. The WebRTC probe under single-process still gathered ICE candidates and
+still opened the microphone with its real device name.
+
+### 9. Neither engine is falling back to software rendering
+
+Worth ruling out rather than assuming, because it would have explained both Firefox's memory
+and its CPU. Asked of the page directly (`tools/gfx-probe.js`):
+
+- Chromium: `ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Ti (0x00002782) Direct3D11 vs_5_0 ps_5_0)`
+- Firefox: `ANGLE (NVIDIA, NVIDIA GeForce GTX 980 Direct3D11 vs_5_0 ps_5_0), or similar`
+  (Firefox deliberately reports an approximate adapter for fingerprinting reasons; the point
+  is that it is a Direct3D11 GPU path, not a software rasteriser.)
+
+Both are hardware accelerated. Firefox's cost is Firefox, not a misconfiguration.
+
+### 10. Memory: the tuning sweep
+
+Two runs per configuration, logged out, sampled 45 s after the page reported itself ready. This
+is the exploration pass that chose what to put in the head-to-head; the spread column is there
+so a difference smaller than the noise is visible as such.
+
+| engine | configuration | ready s | working set | private | processes | CPU s | profile MB | ws spread |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Chromium | default | 6.5 | 548 | 385 | 7 | 7 | 36 | 546-549 |
+| Chromium | `--disable-gpu` | 3.3 | 527 | **294** | 7 | 7 | 33 | 522-532 |
+| Chromium | `--renderer-process-limit=1` | 10.0 | 529 | 375 | 6 | 10 | 36 | 525-533 |
+| Chromium | `--single-process` | 3.3 | **352** | **294** | **1** | 6 | 33 | 351-354 |
+| Firefox | stock, no trimming | 3.2 | 1303 | 1174 | 14 | ~40 | 107 | 1303-1304 |
+| Firefox | trimmed | 3.8 | 1186 | 1103 | 11 | 41 | 87 | 1183-1190 |
+| Firefox | trimmed + `fission.autostart=false` | 3.3 | 1194 | 1107 | 11 | 39 | 127 | 1190-1198 |
+| Firefox | trimmed + no fission + no GPU process | 3.8 | 1112 | 1030 | 10 | 41 | 88 | 1111-1113 |
+| Firefox | `webContentIsolationStrategy=0` + no GPU process | 3.4 | 1141 | 1064 | 10 | 41 | - | 1117-1164 |
+| Firefox | as above + no RDD process | 3.3 | 1124 | 1041 | 10 | 36 | - | 1113-1135 |
+| *(control)* OS webview | as shipped today | - | 376 | 201 | 3 | 12 | - | 370-382 |
+
+Read across that table and three things are settled:
+
+1. **Firefox has a floor at about 1.1 GB and no pref moves it.** Six configurations, from stock
+   to every process-reducing knob Mozilla still honours, span 1112-1303 MB. `fission.autostart`
+   changed nothing measurable (1194 vs 1186, inside the spread), so either it is no longer
+   honoured or it is not what keeps those processes alive. Turning off the GPU process is the
+   only setting worth anything, and it is worth about 70 MB.
+2. **Chromium is roughly half of Firefox before any tuning, and a third of it after.**
+3. **Firefox does about five times as much work for the same page.** 36-41 CPU seconds against
+   6-7, measured over a slightly *longer* window for Chromium since it took longer to be ready.
+   Neither engine is software-rendering (finding 9), so this is simply what each costs. On a
+   laptop that is the battery.
+
+The measurements are also unusually repeatable - most configurations vary by under 10 MB
+between runs - which is worth saying because the Servo round's numbers were not.
+
+### 11. The control that proves the method
+
+Every number above is "sum the working set and private bytes of the whole process tree", and
+that method can be wrong in ways invisible from inside it. So the same script was pointed at
+plain Chrome, `--app`, a scratch profile, logged out (`tools/chrome-control.ps1`):
+
+| | processes | working set | private | profile |
+| --- | --- | --- | --- | --- |
+| plain Chrome, measured today | 10 | **800.4 MB** | 570.9 MB | 102.1 MB |
+| the C# wrapper, measured 2026-09-06 | 10 | **802.9 MB** | - | 102.9 MB |
+
+Two and a half megabytes and one hundred kilobytes apart, on different days by different
+scripts. The method reproduces the number this whole project exists to beat, so the figures
+beside it can be trusted.
+
+It is also the comparison that matters most to the owner: what he runs today is 800 MB across
+ten processes. The bundled Chromium in one process is **352 MB**, which is 44% of it.
+
+### 12. Where that leaves the choice
+
+Stated plainly, because the point of the exercise is a decision.
+
+**Chromium wins on everything that was measured.** Half to a third of Firefox's memory, a fifth
+of its CPU, one process against ten, a third of the profile on disk, and it embeds properly, so
+the tray, close-to-tray, single instance and window geometry keep working with no new machinery.
+At 352 MB in one process it is under the 500 MB the owner called too much (DECISIONS.md #10) and
+is 44% of the 800 MB he runs today.
+
+**Firefox wins on two things, and one of them is not small.**
+
+1. **H.264.** Firefox has it; the public CEF binaries do not and cannot be switched into it.
+   That costs a WhatsApp video call that will not negotiate VP8, and it costs MP4 upload, which
+   other CEF embedders have already hit against WhatsApp specifically. Both are fixable by
+   building CEF from source with `proprietary_codecs=true ffmpeg_branding=Chrome` - a full
+   Chromium build, so a one-off job on a machine with the disk for it, not a rebuild here.
+2. **Notifications with no host code.** Firefox raises real Windows toasts by itself. Chromium
+   needs the bridge in `cef_view.rs` - which is written, measured, and produces real toasts
+   under the app's own identity, so this one is already paid for.
+
+**What Firefox costs, beyond the memory.** It cannot be embedded, so the app finds and adopts
+another process's window; two processes must live and die together; keyboard focus has to be
+forwarded by hand; and its permission prompts are raised into browser UI that an app window
+does not have, which silently broke the microphone until the profile pre-granted it. All of
+that works now. None of it exists on the Chromium side.
+
+**The honest gap in this comparison**: everything above is logged out. The engine that looks
+better on an empty login page is very likely the one that looks better on a synced mailbox, but
+that has not been measured, and neither has a real call - which is the one place Firefox's
+H.264 could turn from a footnote into the deciding factor. `tools/login.ps1` is there for it.

@@ -6,3 +6,21 @@
 /tools/*.png
 /tools/wpn-copy.db*
 /bench-profiles
+
+# The bundled engines. `runtime/firefox` is a real Firefox, 345 MB, downloaded by
+# tools/get-firefox.ps1; the Chromium one is downloaded by the cef crate into
+# ~/.local/share/cef and never lives here. Neither belongs in git: they are third-party
+# binaries with their own licences, and one `git add -A` would put a browser in the history
+# forever.
+/runtime/
+
+# Bench artefacts. The .jsonl rows are the measurements and ARE kept; the per-run stdout and
+# stderr are scratch, and there is one pair per run.
+/tools/bench-*.out
+/tools/bench-*.err
+/tools/probe-*.out
+/tools/probe-*.err
+/tools/login-*.out
+/tools/login-*.err
+/tools/*.out
+/tools/*.err

@@ -4,6 +4,53 @@ Scripts that prove the claims in README.md and FINDINGS.md by running the built 
 was used for the numbers dated 2026-09-07. They expect `target\release\whatsapp.exe` to exist and
 Python 3 with `websocket-client` on PATH. Run from anywhere; paths are script-relative.
 
+## The bundled-engine head to head (2026-09-07)
+
+The instruments for the Chromium-vs-Firefox comparison (DECISIONS.md #15). Everything here
+takes `-Engine cef|firefox|webview2` and does the right per-engine thing, because the two
+candidates differ in ways that break a shared script:
+
+| script | what it proves |
+| --- | --- |
+| `engine-bench.ps1 -Engine X -Runs 3` | **The head-to-head.** Launches the build, waits for the PAGE to say it is ready (not a fixed sleep), samples the whole process tree's working set and private bytes at 60 s and 240 s after that, runs the frame probe, records the profile size, and quits cleanly. One JSON line per run. Refuses to start if another engine build is running. |
+| `bench-summary.py [file.jsonl]` | Medians **and the min-max spread** for every configuration. Read the spread before believing a difference: on the Servo round one build measured 8.5 and 31.2 fps on consecutive runs. |
+| `engine-drive.ps1 -Engine X` | The quick "does it work at all": launch, screenshot the window, print the process tree and what the page says, stop. |
+| `probe-engine.ps1 -Engine X -Script Y.js` | Runs one page-side probe and prints the answer. |
+| `build-cef.ps1 [-Check]` | Builds the bundled-Chromium app. Sets up cmake/ninja/MSVC and forces a SHORT target directory: cmake's compiler probe writes a path ~290 characters long under a normal temp dir and `link.exe` then fails with `LNK1104 ... intermediate.manifest`, which reads like a broken toolchain and is not. |
+| `get-firefox.ps1 [-Version X]` | Downloads the Firefox the app ships and unpacks it into `runtime\firefox` **without installing it**. Mozilla publishes no Windows zip and the `.msi` is a wrapper an administrative install does not open; the NSIS `.exe` is a 7-Zip archive whose `core\` directory is the whole browser. |
+| `login.ps1 -Engine X` | Opens one engine on its own persistent profile so a person can scan the QR, and leaves it running. Every measurement that matters - memory with a real mailbox, frame timing with a real chat list, a real call - needs this first. |
+| `bundle.ps1 -Engine X` | Assembles the **shippable** folder (not the build directory) and reports its real size, so the disk number is what a user would install rather than what the compiler left lying around. Then run the bundle to prove the trim is honest. |
+| `frames.js` | Frame timing, engine-independent, and it **scrolls the chat list while measuring**. An idle page paints nothing and every engine reports the monitor's refresh rate, which measures nothing. On a logged-out window there is no list to scroll and it says `driven: false`; treat those numbers as meaningless. |
+| `page-state.js` | What the page currently is - `qr`, `syncing`, `chats` - plus row count, JS heap (Chromium only) and which browser the page thinks it is. This is what makes "60 seconds after ready" comparable between two engines that load at different speeds. |
+| `webrtc-probe.js` | Whether a voice or video call can happen: RTCPeerConnection, real ICE candidate gathering, the microphone through getUserMedia, and **the codec list**. The codec list is the one that matters; see FINDINGS.md. |
+| `notify-probe.js` | Fires a notification through both the page path and the service-worker path and reports what the page saw. Pair it with `toast-db.py`, which is the ground truth: on WebView2 the page reported "displayed" while Windows recorded nothing. |
+| `notify-test.ps1 -Engine X [-NoBridge]` | The end-to-end toast proof for a bundled engine: checks the Start Menu shortcut, fires both notification paths, screenshots the toast corner, and prints what Windows' own database accepted. `-NoBridge` turns the host-side shim off, which is how you measure what the ENGINE does by itself rather than what our code does for it. |
+| `capability-probe.js` | Everything WhatsApp needs, asked of the page: service worker registered **and controlling**, IndexedDB, SubtleCrypto, WebAssembly, SharedWorker, Web Locks, OPFS, mediaDevices, WebRTC, WebGL, notification permission. Run it after any setting that could quietly remove a capability, above all `--single-process`: a configuration that saves memory by breaking the service worker is not a saving, and none of these announce themselves. |
+| `shim-check.js` | Whether the notification shim actually reached the page, and whether `Notification` is the engine's or ours. Written because the shim demonstrably ran while the constructor it was supposed to replace was still native - "it compiled" says nothing about a script injected from a different process. |
+| `pagescript.ps1` | Dot-sourced helper: `Invoke-Python` and `Wait-ForExit`. Not optional plumbing. `& python` from a detached script fails intermittently with "No process is on the other end of the pipe" while querying console mode, which blanked three probes in one run and made the browser look silent; and the single-instance lock is one shared port, so a Chromium instance still shutting down makes the next Firefox launch exit 0, which reads as a crash that succeeded. |
+| `gfx-probe.js` | Which renderer the engine is really using, from the page's own WebGL adapter string. Written because one engine used about five times the CPU of the other for the same page, and "it fell back to software rendering" is the first explanation worth ruling in or out rather than guessing at. |
+| `chrome-control.ps1` | Plain Chrome, scratch profile, `--app`, measured by exactly the same method. It is a check on the METHOD, not a proposal: the C# wrapper measured 803 MB with this browser, so if this script gives a sane figure the engine numbers beside it can be trusted. |
+| `bidi-eval.py PORT file.js` | Evaluates JS in Firefox. **Firefox removed the Chrome DevTools Protocol in 141**, so `--remote-debugging-port` speaks WebDriver BiDi now and the CDP client fails against it in a way that looks like a broken browser. |
+| `cdp-eval.py PORT file.js` | The same for the Chromium builds. |
+
+Traps these cost, so nobody rediscovers them:
+
+- **Never run two benches at once.** The process sweep of one picks up the other's browser.
+  It produced 1673 MB for a build that measures around 550, and the number looked plausible.
+  `engine-bench.ps1` now refuses to start beside another engine build.
+- **A cleanup that kills processes by image path reaches outside its own run.** An earlier
+  `engine-drive.ps1` killed every bundled Firefox on the machine and silently destroyed a
+  benchmark in another window. Kill your own tree; the job object handles the rest.
+- **Both websocket clients must suppress the Origin header.** Firefox answers 400 and
+  Chromium answers 403 to a DevTools/BiDi websocket that carries one, and `websocket-client`
+  sends one by default. The alternative on Chromium is `--remote-allow-origins=*`, which
+  loosens the browser instead of fixing the client.
+- **Firefox allows one BiDi session and does not free it the moment the socket closes**, so
+  back-to-back probes fail with "Maximum number of active sessions" unless the client calls
+  `session.end`.
+
+## The earlier instruments
+
 | script | what it proves |
 | --- | --- |
 | `picker-drive.ps1 -Action Safe\|Light\|Cancel\|Escape\|List` | Launches `--choose`, screenshots the first-run picker, clicks the named button through UI Automation, and reports whether the process survived and what `mode.txt` says. Kills the app and clears the stored mode afterwards. |

@@ -31,6 +31,10 @@ mod light;
 mod mode;
 mod notify;
 mod paths;
+#[cfg(feature = "cef")]
+mod cef_view;
+#[cfg(all(feature = "firefox", target_os = "windows"))]
+mod firefox_view;
 #[cfg(feature = "servo")]
 mod servo_view;
 mod shortcut;
@@ -39,6 +43,15 @@ mod tray;
 mod webview;
 
 fn main() {
+    // CEF re-runs THIS executable for its render, GPU and utility processes. Those must
+    // hand control straight back to CEF and exit; a subprocess that fell through into the
+    // startup below would try to take the single-instance lock and show a tray icon.
+    // Nothing else may come first.
+    #[cfg(feature = "cef")]
+    if cef_view::intercept() {
+        return;
+    }
+
     // `--quit` asks a running instance to shut down cleanly and exits. Killing the
     // process instead skips the cookie flush, and on Servo that costs the login.
     if std::env::args().any(|a| a == "--quit") {
@@ -58,19 +71,58 @@ fn main() {
         return;
     };
 
-    // Safe mode's engine: our own Servo build when compiled with `--features servo`
-    // (DECISIONS.md #8), otherwise the operating system's webview.
+    // Safe mode's engine. Which one is a build-time choice, because the whole point of
+    // this round is a head-to-head between two bundled engines (DECISIONS.md #15); the
+    // environment variable only exists so a measurement run can force one without a
+    // rebuild, and a build that does not contain that engine says so rather than
+    // quietly falling back to a different one.
     let result = match mode {
-        #[cfg(feature = "servo")]
-        mode::Mode::Safe => servo_view::run().map_err(|e| e.to_string()),
-        #[cfg(not(feature = "servo"))]
-        mode::Mode::Safe => webview::run().map_err(|e| e.to_string()),
+        mode::Mode::Safe => run_safe(),
         mode::Mode::Light => light::run().map_err(|e| e.to_string()),
     };
 
     if let Err(err) = result {
         report_fatal(&format!("{err}"));
     }
+}
+
+/// Which engine safe mode runs on.
+///
+/// | value      | engine                          | built by                |
+/// |------------|---------------------------------|-------------------------|
+/// | `cef`      | bundled Chromium 152, embedded  | `--features cef`        |
+/// | `firefox`  | bundled Firefox, adopted window | `--features firefox`    |
+/// | `webview2` | the OS webview (Edge's engine)  | always; the fallback    |
+/// | `servo`    | our Servo fork (retired, #13)   | `--features servo`      |
+fn run_safe() -> Result<(), String> {
+    let requested = std::env::var("WHATSAPP_RS_ENGINE").unwrap_or_default();
+    match requested.as_str() {
+        "cef" => {
+            #[cfg(feature = "cef")]
+            return cef_view::run();
+            #[cfg(not(feature = "cef"))]
+            return Err("this build has no bundled Chromium: rebuild with --features cef".into());
+        }
+        "firefox" => {
+            #[cfg(all(feature = "firefox", target_os = "windows"))]
+            return firefox_view::run();
+            #[cfg(not(all(feature = "firefox", target_os = "windows")))]
+            return Err("this build has no bundled Firefox: rebuild with --features firefox".into());
+        }
+        "webview2" | "os" => return webview::run().map_err(|e| e.to_string()),
+        "" => {}
+        other => return Err(format!("unknown engine {other:?}")),
+    }
+
+    // No explicit choice: whichever engine this binary was built with.
+    #[cfg(feature = "cef")]
+    return cef_view::run();
+    #[cfg(all(feature = "firefox", target_os = "windows", not(feature = "cef")))]
+    return firefox_view::run();
+    #[cfg(all(feature = "servo", not(feature = "cef"), not(feature = "firefox")))]
+    return servo_view::run().map_err(|e| e.to_string());
+    #[allow(unreachable_code)]
+    webview::run().map_err(|e| e.to_string())
 }
 
 /// A GUI app has no console to print to, so a failure that would otherwise be

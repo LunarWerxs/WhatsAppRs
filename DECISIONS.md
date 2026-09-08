@@ -146,3 +146,46 @@ is dishonest by omission.
 The C# Chrome wrapper it replaces: 802.9 MB RAM across 10 processes, 342.8 MB profile directory.
 The Rust + WebView2 probe: 623.8 MB RAM across 7 processes, 36.1 MB fresh profile,
 projected about 92 MB once his real message history is present.
+
+## Built and measured under #15, 2026-09-07
+
+Not a new ruling: the record of what the two candidates turned out to be, so #15 is decided
+from data. Full numbers and method in FINDINGS.md, "Bundled Chromium vs bundled Firefox".
+
+**Both were built and both work**, in the app's own window, with the tray, close-to-tray,
+single instance and window geometry the current design already has.
+
+- **Chromium is embedded** (`src/cef_view.rs`, the `cef` crate 152.0.0+152.0.5). The browser is
+  a child window of ours, exactly as WebView2 was, so nothing about the surrounding app
+  changed. The phone will call it **Chrome**.
+- **Firefox is adopted** (`src/firefox_view.rs`). Gecko cannot be embedded, so the app ships a
+  real Firefox 155.0.1, launches it on a private profile, finds its window and takes it with
+  `SetParent`. That works and holds. It also brings back three things this design had deleted:
+  finding another process's window, keeping two processes alive and dead together (a job
+  object), and forwarding keyboard focus by hand. The phone will call it **Firefox**.
+
+Three things were learned that change the shape of the choice, and none of them was
+predictable from documentation:
+
+1. **The bundled Chromium has no H.264.** The official CEF binaries are built without
+   proprietary codecs, and there is no switch that turns them on - it is compiled out.
+   Measured: Firefox offers H264, our CEF offers VP8/VP9/AV1 only. Both have Opus, so audio
+   calls are equal. What this costs is a video call that insists on H.264, and, separately and
+   already documented by other CEF users, **uploading an MP4 to WhatsApp fails without it**.
+   The fix exists and is expensive: build CEF from source with
+   `proprietary_codecs=true ffmpeg_branding=Chrome`, which is a full Chromium build.
+2. **CEF's Chrome runtime style crashes with a window we own.** It is the style that carries
+   Chromium's own notification machinery, and with a browser created as a child of a native
+   window it dies with an access violation immediately after creation, twice out of two, with
+   nothing in the log. The build uses Alloy style, whose cost is that CEF then displays no web
+   notifications at all - so the host draws them, which is exactly what the WebView2 build
+   already had to do.
+3. **Firefox's permission prompts are unreachable in an app window.** Firefox asks for the
+   microphone with a doorhanger anchored to the URL bar, and the URL bar is what makes it look
+   like a browser, so it is hidden. Measured: the request never gets an answer and a call would
+   hang silently. Fixed by pre-granting in the profile the app writes.
+
+Both bundles are big and within 20 MB of each other: **325 MB** for the trimmed Chromium,
+**344 MB** for the trimmed Firefox, against about 2 MB for the OS-webview build that bundles
+nothing. That is the price of the engine being ours rather than the machine's, and it is not
+avoidable by trimming.

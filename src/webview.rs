@@ -171,8 +171,15 @@ pub(crate) fn run() -> wry::Result<()> {
                 if window.is_visible() {
                     record_geometry(&window, &mut store);
                 }
-                if single_instance::poll_show_request(&listener) {
+                // poll_requests, NOT poll_show_request: the latter discards a queued quit,
+                // so `whatsapp.exe --quit` was silently ignored here too.
+                let requests = single_instance::poll_requests(&listener);
+                if requests.show {
                     show(&window);
+                }
+                if requests.quit {
+                    record_geometry(&window, &mut store);
+                    *control_flow = ControlFlow::Exit;
                 }
             }
 

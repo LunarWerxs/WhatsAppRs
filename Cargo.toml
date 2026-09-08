@@ -65,8 +65,20 @@ keyboard-types = { version = "0.8.3", optional = true }
 # network thread panics on its first request. Same choice as servoshell.
 rustls = { version = "0.23", features = ["aws-lc-rs"], optional = true }
 
+# Safe mode on a bundled Chromium (DECISIONS.md #15). The Chromium Embedded Framework
+# through the tauri-apps `cef` crate, which tracks Chromium 152 - the same major the OS
+# webview on this machine runs, so the comparison is engine-to-engine and not
+# version-to-version. Opt-in because the runtime is a 171 MB download and the wrapper
+# needs cmake + ninja + MSVC. `sandbox` is off: CEF's Windows sandbox needs a separate
+# bootstrap executable, which would make this two binaries instead of one.
+cef = { version = "152.0.0", default-features = false, features = ["resources"], optional = true }
+
 [features]
 servo = ["dep:servo", "dep:winit", "dep:euclid", "dep:url", "dep:keyboard-types", "dep:rustls"]
+cef = ["dep:cef"]
+# Safe mode on a bundled Firefox. No extra crates: Gecko cannot be embedded, so this is
+# process management and window adoption, both of which the `windows` crate already covers.
+firefox = []
 
 # Servo's SQLite wrapper and light mode's session store must link the same native
 # SQLite. The fork pins rusqlite 0.39 for that; its query-builder adapter has no
@@ -114,6 +126,12 @@ features = [
   "Win32_Graphics_GdiPlus",
   "Win32_Graphics_Dwm",
   "Win32_System_Registry",
+  # Firefox mode (firefox_view.rs): adopting another process's window, identifying which
+  # process owns it, and a job object so the browser cannot outlive the host.
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+  # CreateJobObjectW takes a SECURITY_ATTRIBUTES, so the whole call is gated on this.
+  "Win32_Security",
 ]
 
 # Embeds the manifest that makes TaskDialogIndirect resolvable (Common Controls
@@ -131,6 +149,17 @@ webkit2gtk = { version = "2.0.2", features = ["v2_16"] }
 opt-level = "z"
 lto = true
 codegen-units = 1
+panic = "abort"
+strip = true
+
+# The bundled-Chromium build. Kept out of `release` so it never fights the other builds
+# for the target lock, and out of whole-program LTO, which buys nothing across an FFI
+# boundary into a 272 MB prebuilt DLL and costs minutes.
+[profile.cefapp]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
 panic = "abort"
 strip = true
 

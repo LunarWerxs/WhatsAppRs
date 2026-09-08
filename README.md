@@ -3,10 +3,46 @@
 WhatsApp Web as a small native tray app. Windows, Linux, and macOS-shaped but untested.
 Written from scratch. No forked code.
 
+> **Current direction, 2026-09-07.** Safe mode now has four engine backends, chosen at build time,
+> and two of them are new candidates being compared head to head (DECISIONS.md #15):
+>
+> | engine | how to build it | what the phone calls it |
+> | --- | --- | --- |
+> | **bundled Chromium** (`src/cef_view.rs`) | `tools/build-cef.ps1`, output `D:\ct\cefapp` | Chrome |
+> | **bundled Firefox** (`src/firefox_view.rs`) | `cargo build --release --features firefox` | Firefox |
+> | the OS webview (`src/webview.rs`) | `cargo build --release` | Microsoft Edge (rejected) |
+> | Servo (`src/servo_view.rs`) | retired, DECISIONS.md #13 | Firefox |
+>
+> `WHATSAPP_RS_ENGINE=cef|firefox|webview2` picks one at run time within a build that contains it.
+> The comparison, and the two findings that decide it, are the last section of FINDINGS.md.
+> Light mode is retired (DECISIONS.md #14); its code is still here and unmaintained.
+
 **786 KB release binary.** The rendering engine is the one your OS already ships, so nothing is
 bundled: WebView2 on Windows, WebKitGTK on Linux, WKWebView on macOS.
 
-## Measured against the C# Chrome wrapper it replaces
+## The two bundled engines, measured 2026-09-07
+
+Logged out, same instruments, whole process tree, sampled after the page reported itself ready.
+Full method and every configuration in FINDINGS.md; the short version:
+
+| | processes | RAM (working set) | RAM (private) | CPU to load | engine on disk | phone shows |
+| --- | --- | --- | --- | --- | --- | --- |
+| **bundled Chromium, one process** | **1** | **352 MB** | 294 MB | **6 s** | 325 MB | Chrome |
+| bundled Chromium, default | 7 | 548 MB | 385 MB | 7 s | 325 MB | Chrome |
+| **bundled Firefox, best of six configs** | 10 | **1112 MB** | 1030 MB | 41 s | 344 MB | Firefox |
+| *(control)* the OS webview, as shipped today | 3 | 376 MB | 201 MB | 12 s | nothing | Microsoft Edge |
+| *(control)* plain Chrome, what the C# app drives | 10 | 800 MB | 571 MB | 12 s | already installed | Chrome |
+
+The last row is the check on the method, not a proposal: it reproduces the 803 MB the C# wrapper
+measured on a different day with a different script, so the numbers beside it can be trusted.
+
+**Chromium wins on everything measurable and loses on one thing that is not.** The official CEF
+binaries carry no H.264, and there is no switch for it - so WhatsApp video calls that insist on
+H.264 and, already documented by other CEF users, **uploading an MP4 to WhatsApp**, are the price.
+Firefox has H.264 and also raises real Windows toasts by itself, where Chromium needs the host to
+draw them. See FINDINGS.md, "Bundled Chromium vs bundled Firefox".
+
+## Measured against the C# Chrome wrapper it replaces (the OS-webview build)
 
 | | This app | Old C# wrapper |
 | --- | --- | --- |

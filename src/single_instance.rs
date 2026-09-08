@@ -76,10 +76,11 @@ pub fn poll_requests(listener: &TcpListener) -> Requests {
     requests
 }
 
-/// Drain any pending "show" requests. Returns true if another launch asked us to surface.
-pub fn poll_show_request(listener: &TcpListener) -> bool {
-    poll_requests(listener).show
-}
+// There used to be a `poll_show_request` here that returned only `.show`. It is gone
+// deliberately: three of the four engine backends used it, and because it DROPPED a queued
+// quit, `whatsapp.exe --quit` did nothing on any of them. Every restart then ended in a
+// kill, which skips the session flush and costs the WhatsApp login. A convenience wrapper
+// that silently discards half the message is not worth the line it saves.
 
 /// Ask a running instance to quit cleanly. False if nothing was listening.
 pub fn request_quit(port: Option<u16>) -> bool {
