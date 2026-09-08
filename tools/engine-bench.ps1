@@ -44,6 +44,7 @@ param(
     [int]$InstancePort = 47931
 )
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\pagescript.ps1"
 Add-Type -AssemblyName System.Drawing
 
 if (-not $Exe) {
@@ -248,7 +249,7 @@ for ($run = 1; $run -le $Runs; $run++) {
 
     # A clean shutdown, not a kill: Chromium flushes cookies on exit and Firefox flushes
     # its profile, and on both a kill is how you lose a WhatsApp login.
-    & $Exe --quit 2>&1 | Out-Null
+    Request-Quit -Exe $Exe
     Start-Sleep -Seconds 4
     Stop-Everything
 }

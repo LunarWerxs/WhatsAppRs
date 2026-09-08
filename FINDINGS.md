@@ -586,9 +586,11 @@ twice out of two, with nothing in `cef.log`. The identical build under Alloy sty
 style wants CEF's own Views window, which is not a window we own, and owning the window is the whole
 design.
 
-So the build is Alloy, and Alloy's cost is that its default answer to a permission prompt is
-*ignore*: notifications are silently dead unless the host answers. That is what the permission
-handler and the `SetContentSetting` call in `cef_view.rs` exist for.
+So the build is Alloy, and Alloy has two costs. Its default answer to a permission prompt is
+*ignore*, so a request the host does not answer hangs forever - that is what the permission
+handler and the `SetContentSetting` call in `cef_view.rs` exist for. And, worse and separately,
+Alloy turns Blink's notification support off outright, so granting the permission is not enough:
+nothing is ever displayed. Finding 7 measures that and describes the bridge that fixes it.
 
 ### 4. Firefox removed the Chrome DevTools Protocol in 141
 
@@ -678,12 +680,25 @@ Windows had recorded nothing and no toast had appeared.
 | bundled Chromium, host bridge ON | identical | **two toasts under `com.lunarwerx.whatsapp-rs`** |
 | bundled Firefox | identical | **one toast under `FirefoxPortableToast-45C7D66DB3C307DD`** |
 
-So the page's report is once again worth nothing, and the two engines differ:
+Both toasts were then confirmed **on screen**, not just in the database, and the screenshots
+show the difference that matters more than which engine needed help:
+
+| | toast header | toast body |
+| --- | --- | --- |
+| bundled Chromium + our bridge | **"WhatsApp Rs"**, the app's own name and identity | the notification's title and text |
+| bundled Firefox, unaided | **"Firefox"**, with the Firefox logo | the text, plus "via web.whatsapp.com" |
+
+So Firefox does it for free and gets it wrong: every WhatsApp message would announce itself as
+Firefox in the Action Center. Chromium needed code and gets it right, because the host raises the
+toast under the AppUserModelID `shortcut.rs` registers. Fixing Firefox's branding would mean
+registering our own COM notification server and persuading Firefox to use it, which is more work
+than the Chromium bridge that already exists.
+
+The page's report is, once again, worth nothing, and the two engines differ:
 
 - **Firefox raises a real Windows toast with no host code at all.** It registers its own COM
-  notification server and files the toast under an identity derived from the install path.
-  That is a genuine advantage - and the identity is Firefox's, not ours, so the toast is not
-  branded as the app without further work.
+  notification server and files the toast under an identity derived from the install path
+  (`FirefoxPortableToast-<hash>`), which is why it is branded Firefox.
 - **CEF displays nothing.** Alloy style turns Blink's notification support off outright, and
   CEF exposes no callback that hands a notification's title and body to the host: `CefClient`
   declares eighteen handler factories and none of them is about notifications. So `cef_view.rs`
@@ -742,7 +757,7 @@ so a difference smaller than the noise is visible as such.
 | Chromium | default | 6.5 | 548 | 385 | 7 | 7 | 36 | 546-549 |
 | Chromium | `--disable-gpu` | 3.3 | 527 | **294** | 7 | 7 | 33 | 522-532 |
 | Chromium | `--renderer-process-limit=1` | 10.0 | 529 | 375 | 6 | 10 | 36 | 525-533 |
-| Chromium | `--single-process` | 3.3 | **352** | **294** | **1** | 6 | 33 | 351-354 |
+| Chromium | `--single-process` | 3.3 | **352** | **294** | **1** | 6 | 36 | 351-354 |
 | Firefox | stock, no trimming | 3.2 | 1303 | 1174 | 14 | ~40 | 107 | 1303-1304 |
 | Firefox | trimmed | 3.8 | 1186 | 1103 | 11 | 41 | 87 | 1183-1190 |
 | Firefox | trimmed + `fission.autostart=false` | 3.3 | 1194 | 1107 | 11 | 39 | 127 | 1190-1198 |
@@ -795,6 +810,13 @@ the tray, close-to-tray, single instance and window geometry keep working with n
 At 352 MB in one process it is under the 500 MB the owner called too much (DECISIONS.md #10) and
 is 44% of the 800 MB he runs today.
 
+**One number does not go Chromium's way, and it should be said.** The OS webview - the design
+being replaced - is still the lightest thing here on private bytes: 201 MB against the bundled
+Chromium's 294 MB, though its working set is higher (376 vs 352) because it spreads across three
+processes. Bundling an engine costs about 90 MB of real memory and 325 MB of disk over using the
+one already on the machine. That is the price of not being Edge, and it is the price the owner
+already decided to pay when he asked for this comparison.
+
 **Firefox wins on two things, and one of them is not small.**
 
 1. **H.264.** Firefox has it; the public CEF binaries do not and cannot be switched into it.
@@ -802,9 +824,11 @@ is 44% of the 800 MB he runs today.
    other CEF embedders have already hit against WhatsApp specifically. Both are fixable by
    building CEF from source with `proprietary_codecs=true ffmpeg_branding=Chrome` - a full
    Chromium build, so a one-off job on a machine with the disk for it, not a rebuild here.
-2. **Notifications with no host code.** Firefox raises real Windows toasts by itself. Chromium
-   needs the bridge in `cef_view.rs` - which is written, measured, and produces real toasts
-   under the app's own identity, so this one is already paid for.
+2. **Notifications with no host code.** Firefox raises real Windows toasts by itself. This one
+   is thinner than it looks: Firefox's toasts are branded **"Firefox"**, so every message would
+   announce itself as the browser rather than the app, and Chromium's bridge - written,
+   measured, and confirmed on screen - produces toasts headed **"WhatsApp Rs"**. Firefox saves
+   the work and loses the branding.
 
 **What Firefox costs, beyond the memory.** It cannot be embedded, so the app finds and adopts
 another process's window; two processes must live and die together; keyboard focus has to be

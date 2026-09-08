@@ -40,6 +40,23 @@ function Invoke-Python {
     }
 }
 
+# Ask a running instance to shut down cleanly.
+#
+# `& $Exe --quit` is the obvious spelling and it is the same trap as `& python`: from a
+# detached script with no console it fails intermittently with "No process is on the other
+# end of the pipe" and, because $ErrorActionPreference is Stop, aborts the whole run. It did,
+# mid-benchmark, after the identical bug had already been fixed for python.
+function Request-Quit {
+    param([Parameter(Mandatory)][string]$Exe, [int]$TimeoutSeconds = 20)
+    try {
+        $proc = Start-Process -FilePath $Exe -ArgumentList '--quit' -PassThru -WindowStyle Hidden `
+                    -WorkingDirectory (Split-Path $Exe)
+        [void]$proc.WaitForExit($TimeoutSeconds * 1000)
+    } catch {
+        Write-Host "    (--quit could not start: $($_.Exception.Message))"
+    }
+}
+
 # Wait until no engine build is running, so the next launch takes the single-instance lock
 # instead of seeing one held and exiting with code 0 - which looks exactly like a crash that
 # returned success, and blanked two probes before it was noticed.

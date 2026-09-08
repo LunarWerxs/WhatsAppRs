@@ -29,10 +29,11 @@ another day with another script, so the rest can be trusted.
 
 - **`src/cef_view.rs`** - Chromium embedded, through the `cef` crate (CEF 152). A real child
   window inside ours, so tray, close-to-tray, single instance and geometry are unchanged.
-  Build: `tools\build-cef.ps1` -> `D:\ct\cefapp\whatsapp.exe`. Phone will say **Chrome**.
+  Build: `tools\build-cef.ps1` -> `D:\ct\cefapp\whatsapp.exe`. The page reports **Chrome 152**;
+  what the phone's linked-device list says is not confirmed until someone links it.
 - **`src/firefox_view.rs`** - a real Firefox 155.0.1 we ship, launched on a private profile and
   its window adopted with `SetParent`. Build: `cargo build --release --features firefox`.
-  Get the runtime with `tools\get-firefox.ps1`. Phone will say **Firefox**.
+  Get the runtime with `tools\get-firefox.ps1`. The page reports **Firefox 155**; same caveat.
 - `src/webview.rs` (OS webview) and `src/servo_view.rs` (retired) still build.
   `WHATSAPP_RS_ENGINE=cef|firefox|webview2` picks one inside a build that has it.
 

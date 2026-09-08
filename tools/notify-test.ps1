@@ -73,6 +73,6 @@ $b.Save($shot)
 Get-Content "$PSScriptRoot\notify-$Engine.err" -Tail 15 -ErrorAction SilentlyContinue |
     ForEach-Object { $_.Substring(0, [Math]::Min(200, $_.Length)) }
 
-& $Exe --quit 2>&1 | Out-Null
+Request-Quit -Exe $Exe
 Start-Sleep -Seconds 3
 Get-Process whatsapp -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $Exe } | Stop-Process -Force -ErrorAction SilentlyContinue

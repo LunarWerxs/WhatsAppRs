@@ -87,7 +87,7 @@ Get-Content "$OutDir\$Tag.err" -Tail 25 -ErrorAction SilentlyContinue |
     ForEach-Object { $_.Substring(0, [Math]::Min(200, $_.Length)) }
 
 if (-not $Keep) {
-    & $Exe --quit 2>&1 | Out-Null
+    Request-Quit -Exe $Exe
     Start-Sleep -Seconds 3
     # Only this run's tree. An earlier version killed every bundled Firefox on the
     # machine, which silently destroyed a benchmark running in another window.

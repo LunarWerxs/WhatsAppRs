@@ -49,7 +49,7 @@ Get-Content "$PSScriptRoot\probe-$Engine.err" -Tail 12 -ErrorAction SilentlyCont
     ForEach-Object { $_.Substring(0, [Math]::Min(200, $_.Length)) }
 
 if (-not $Keep) {
-    & $Exe --quit 2>&1 | Out-Null
+    Request-Quit -Exe $Exe
     Start-Sleep -Seconds 3
     # Only our own process. The job object in firefox_view.rs takes the browser with it,
     # so there is no need to hunt Firefox processes here - and hunting them by image path
