@@ -1,4 +1,6 @@
 /target
+# CI points CEF_PATH at the workspace; never let 171 MB of engine near git.
+/.cef/
 /probe-report.jsonl
 /probe-profile
 /app-window.png

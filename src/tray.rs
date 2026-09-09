@@ -80,7 +80,7 @@ pub fn build(state: State) -> Option<Tray> {
     );
     let about = MenuItem::with_id(
         ABOUT_ID,
-        &format!("whatsapp-rs {}", env!("CARGO_PKG_VERSION")),
+        format!("whatsapp-rs {}", env!("CARGO_PKG_VERSION")),
         true,
         None,
     );

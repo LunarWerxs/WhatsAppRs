@@ -223,8 +223,7 @@ mod windows_impl {
 
         let persist: IPersistFile = shell_link.cast().map_err(|e| e.to_string())?;
         let link_w = wide(&link.to_string_lossy());
-        unsafe { persist.Save(PCWSTR(link_w.as_ptr()), true) }
-            .map_err(|e| format!("Save: {e}"))?;
+        unsafe { persist.Save(PCWSTR(link_w.as_ptr()), true) }.map_err(|e| format!("Save: {e}"))?;
         Ok(())
     }
 
@@ -245,7 +244,9 @@ mod windows_impl {
                     wReserved1: 0,
                     wReserved2: 0,
                     wReserved3: 0,
-                    Anonymous: PROPVARIANT_0_0_0 { pwszVal: PWSTR(mem) },
+                    Anonymous: PROPVARIANT_0_0_0 {
+                        pwszVal: PWSTR(mem),
+                    },
                 }),
             },
         })

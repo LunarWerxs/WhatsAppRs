@@ -1,0 +1,84 @@
+# The check that did not exist on 2026-09-09.
+#
+# `--in-process-gpu` sat in the shipped switch list for two days. It removed Chromium's
+# context-loss circuit breaker, a routine NVIDIA driver reset then retried eglCreateContext
+# about seven thousand times a second for eight and three quarter hours, and it cost a 244 GB
+# log file, 10.9 GB of RAM and 8.3 CPU-hours before a person happened to look at Task Manager.
+# Nothing in this repository could have caught it, because there was no CI at all.
+#
+# `cargo test` now carries `in_process_gpu_is_never_shipped`, which fails in milliseconds if
+# that switch or `--single-process` gets back into the list. This is what runs it.
+#
+# ⛔ GITHUB-HOSTED, NEVER A SELF-HOSTED RUNNER. This repository is PUBLIC, so a fork's pull
+# request would execute a stranger's code on whatever machine the runner lives on. Public
+# repositories get unlimited free hosted minutes, so there is nothing to save by doing that.
+#
+# ⛔ NOT the soak test. `tools/soak.ps1` launches a real Chromium, needs a network and takes
+# ten minutes; it stays a thing a person runs before shipping. This job is the fast half.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CEF_PATH: ${{ github.workspace }}/.cef
+
+jobs:
+  windows:
+    # Windows because that is what this app targets and what the Win32 code in watchdog.rs,
+    # shortcut.rs and setup_window.rs compiles against at all.
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # PINNED, deliberately. `stable` would drag in each new clippy release, and a lint that
+      # did not exist yesterday turning the build red on its own is how a team learns to
+      # ignore CI. Bump this on purpose, and fix what the bump finds in that same commit.
+      - name: Rust 1.98.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      # The `cef` crate downloads a ~171 MB CEF binary distribution and compiles CEF's C++
+      # wrapper with cmake and ninja. Without a cache that happens on every single run.
+      # Keyed on the lockfile, so a CEF version bump correctly misses and re-downloads.
+      - name: Cache the CEF binary distribution
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CEF_PATH }}
+          key: cef-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      # windows-latest already carries MSVC, cmake and ninja, which is the whole reason this
+      # runs there rather than needing the Visual Studio Build Tools dance tools/build.ps1
+      # does locally.
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --release --all-targets -- -D warnings
+
+      # THE ONE THAT MATTERS. Among these is in_process_gpu_is_never_shipped.
+      - name: Tests
+        run: cargo test --release
+
+      # Not `cargo build`: the tests above already link the binary, and building it twice
+      # doubles the slowest step for nothing.

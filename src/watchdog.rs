@@ -311,7 +311,9 @@ impl Watchdog {
                     .last_private
                     .map(|p| (p / (1024 * 1024)).to_string())
                     .unwrap_or_else(|| "?".into());
-                eprintln!("[whatsapp-rs] watchdog: rolled cef.log at {len} bytes, tree private {mb} MB");
+                eprintln!(
+                    "[whatsapp-rs] watchdog: rolled cef.log at {len} bytes, tree private {mb} MB"
+                );
             }
             // The cap is the only thing standing between a firehose and the user's disk, so
             // if emptying the log stops working there is nothing left - and this module
@@ -396,7 +398,10 @@ fn private_bytes() -> Option<TreeMemory> {
         let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
             // No walk at all: this is the browser process alone, which is roughly a tenth of
             // the tree and would quietly make the ceiling ten times harder to reach.
-            return Some(TreeMemory { private: total, undercount: true });
+            return Some(TreeMemory {
+                private: total,
+                undercount: true,
+            });
         };
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -429,7 +434,10 @@ fn private_bytes() -> Option<TreeMemory> {
         }
         let _ = CloseHandle(snapshot);
     }
-    Some(TreeMemory { private: total, undercount })
+    Some(TreeMemory {
+        private: total,
+        undercount,
+    })
 }
 
 /// # Safety
@@ -578,7 +586,10 @@ mod tests {
 
         w.tick();
 
-        assert_eq!(w.roll_failures, 1, "a failed roll must be counted, not swallowed");
+        assert_eq!(
+            w.roll_failures, 1,
+            "a failed roll must be counted, not swallowed"
+        );
         assert!(!w.alarmed_roll, "one failure is not yet worth a toast");
         assert_eq!(
             std::fs::metadata(&log).unwrap().len(),
@@ -586,9 +597,16 @@ mod tests {
             "nothing was emptied, and the code must not pretend otherwise"
         );
 
-        let mut perms = std::fs::metadata(&log).unwrap().permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(&log, perms).unwrap();
+        // Clearing FILE_ATTRIBUTE_READONLY so the scratch directory can be deleted. Clippy
+        // dislikes `set_readonly(false)` because on Unix it grants write to *everyone*; this
+        // is a Windows-only test over a file in its own temp directory, and without it
+        // `remove_dir_all` cannot remove what the test just made read-only.
+        #[allow(clippy::permissions_set_readonly_false)]
+        {
+            let mut perms = std::fs::metadata(&log).unwrap().permissions();
+            perms.set_readonly(false);
+            std::fs::set_permissions(&log, perms).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -599,7 +617,10 @@ mod tests {
         let seen = private_bytes();
         if cfg!(target_os = "windows") {
             let m = seen.expect("private_bytes must read this process on Windows");
-            assert!(m.private > 0, "a running process holds more than zero private bytes");
+            assert!(
+                m.private > 0,
+                "a running process holds more than zero private bytes"
+            );
         }
     }
 
@@ -617,7 +638,10 @@ mod tests {
             !w.alarmed_memory,
             "one sample over the ceiling must not raise a toast"
         );
-        assert_eq!(w.memory_breaches, if cfg!(target_os = "windows") { 1 } else { 0 });
+        assert_eq!(
+            w.memory_breaches,
+            if cfg!(target_os = "windows") { 1 } else { 0 }
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

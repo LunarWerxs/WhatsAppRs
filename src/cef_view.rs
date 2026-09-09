@@ -439,7 +439,10 @@ fn toast_verdict() -> ToastVerdict {
         Some(start) if now.duration_since(start) < TOAST_WINDOW => {}
         _ => {
             if gate.dropped > 0 {
-                eprintln!("[whatsapp-rs] dropped {} toasts over the burst limit", gate.dropped);
+                eprintln!(
+                    "[whatsapp-rs] dropped {} toasts over the burst limit",
+                    gate.dropped
+                );
             }
             gate.window_start = Some(now);
             gate.raised = 0;
@@ -495,10 +498,7 @@ fn raise_toast(payload: &str) {
             return;
         }
     }
-    notify::toast(
-        if title.is_empty() { "WhatsApp" } else { title },
-        body,
-    );
+    notify::toast(if title.is_empty() { "WhatsApp" } else { title }, body);
 }
 
 fn resize_browser(w: i32, h: i32) {
@@ -552,7 +552,9 @@ wrap_task! {
 /// and would also silence a voice call, which is the opposite of what "mute
 /// notifications" means. The shim (`NOTIFY_SHIM_JS`) mutes only the short alert sounds.
 fn push_mute(browser: &Browser, on: bool) {
-    let Some(frame) = browser.main_frame() else { return };
+    let Some(frame) = browser.main_frame() else {
+        return;
+    };
     let js = format!("if (window.__waRsSetMute) window.__waRsSetMute({on});");
     frame.execute_java_script(
         Some(&CefString::from(js.as_str())),

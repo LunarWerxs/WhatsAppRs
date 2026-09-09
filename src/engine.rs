@@ -86,7 +86,11 @@ pub fn prepare(is_subprocess: bool) -> Result<Engine, String> {
     // there is nothing to unpack and the payload (if this build even has one) is ignored.
     if SENTINELS.iter().all(|f| exe_dir.join(f).exists()) {
         load_dlls(&exe_dir)?;
-        return Ok(Engine { dir: exe_dir, extracted: false, beside_exe: true });
+        return Ok(Engine {
+            dir: exe_dir,
+            extracted: false,
+            beside_exe: true,
+        });
     }
 
     let footer = Footer::read(&exe)?;
@@ -96,7 +100,11 @@ pub fn prepare(is_subprocess: bool) -> Result<Engine, String> {
     // Already unpacked, by an earlier run or by the browser process that spawned this one.
     if manifest_matches(&dir) {
         load_dlls(&dir)?;
-        return Ok(Engine { dir, extracted: false, beside_exe: false });
+        return Ok(Engine {
+            dir,
+            extracted: false,
+            beside_exe: false,
+        });
     }
 
     if is_subprocess {
@@ -111,7 +119,11 @@ pub fn prepare(is_subprocess: bool) -> Result<Engine, String> {
 
     unpack(&exe, &footer, &root, &dir)?;
     load_dlls(&dir)?;
-    Ok(Engine { dir, extracted: true, beside_exe: false })
+    Ok(Engine {
+        dir,
+        extracted: true,
+        beside_exe: false,
+    })
 }
 
 /// Old versions' engine folders, deleted after a new one has started successfully.
@@ -120,7 +132,9 @@ pub fn prepare(is_subprocess: bool) -> Result<Engine, String> {
 /// to make the user wait for it. Called from a background thread once the browser is up.
 pub fn sweep_old(keep: &Path) {
     let Some(root) = keep.parent() else { return };
-    let Ok(entries) = fs::read_dir(root) else { return };
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path == keep || !path.is_dir() {
@@ -178,7 +192,8 @@ impl Footer {
     /// The last 64 bytes of our own executable. Reading it is a seek and a 64-byte read, so
     /// every CEF subprocess can afford to do it rather than be told the answer.
     fn read(exe: &Path) -> Result<Footer, String> {
-        let mut file = File::open(exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
+        let mut file =
+            File::open(exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
         let len = file
             .seek(SeekFrom::End(0))
             .map_err(|e| format!("seek: {e}"))?;
@@ -188,7 +203,8 @@ impl Footer {
         file.seek(SeekFrom::End(-(FOOTER_LEN as i64)))
             .map_err(|e| format!("seek: {e}"))?;
         let mut buf = [0u8; FOOTER_LEN];
-        file.read_exact(&mut buf).map_err(|e| format!("read: {e}"))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("read: {e}"))?;
         if &buf[56..64] != FOOTER_MAGIC {
             return Err(
                 "this executable carries no engine payload - build it with tools/build.ps1 \
@@ -238,7 +254,9 @@ struct Entry {
 fn payload_reader(exe: &Path, footer: &Footer) -> Result<impl Read, String> {
     let mut file = File::open(exe).map_err(|e| format!("cannot read {}: {e}", exe.display()))?;
     let start = file
-        .seek(SeekFrom::End(-(FOOTER_LEN as i64 + footer.payload_len as i64)))
+        .seek(SeekFrom::End(
+            -(FOOTER_LEN as i64 + footer.payload_len as i64),
+        ))
         .map_err(|e| format!("seek: {e}"))?;
     let _ = start;
     let compressed = file.take(footer.payload_len);
@@ -252,7 +270,8 @@ fn payload_reader(exe: &Path, footer: &Footer) -> Result<impl Read, String> {
 
 fn read_exact_n(r: &mut impl Read, n: usize) -> Result<Vec<u8>, String> {
     let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf).map_err(|e| format!("payload: {e}"))?;
+    r.read_exact(&mut buf)
+        .map_err(|e| format!("payload: {e}"))?;
     Ok(buf)
 }
 
@@ -295,11 +314,15 @@ fn safe_relative(path: &str) -> Result<PathBuf, String> {
         || path.starts_with('/')
         || path.contains(':')
         || path.contains('\\')
-        || path.split('/').any(|c| c.is_empty() || c == "." || c == "..");
+        || path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..");
     if bad {
         return Err(format!("refusing payload path {path:?}"));
     }
-    Ok(PathBuf::from(path.replace('/', std::path::MAIN_SEPARATOR_STR)))
+    Ok(PathBuf::from(
+        path.replace('/', std::path::MAIN_SEPARATOR_STR),
+    ))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -315,7 +338,8 @@ fn unpack(exe: &Path, footer: &Footer, root: &Path, dir: &Path) -> Result<(), St
     fs::create_dir_all(root).map_err(|e| format!("cannot create {}: {e}", root.display()))?;
     let staging = root.join(format!(".tmp-{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
-    fs::create_dir_all(&staging).map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("cannot create {}: {e}", staging.display()))?;
 
     // The index is read here, not inside the extractor, so the progress bar's total is the sum
     // of the file sizes and not `stream_len` - the difference being the index itself, which the
@@ -341,9 +365,8 @@ fn unpack(exe: &Path, footer: &Footer, root: &Path, dir: &Path) -> Result<(), St
 
     let result = extract_all(&mut reader, &entries, &staging, &done);
     window.close();
-    result.map_err(|e| {
+    result.inspect_err(|_| {
         let _ = fs::remove_dir_all(&staging);
-        e
     })?;
 
     // Two double-clicks in a row start two processes, and both reach this point before either
@@ -381,7 +404,10 @@ fn unpack(exe: &Path, footer: &Footer, root: &Path, dir: &Path) -> Result<(), St
         Err(_) if manifest_matches(dir) => adopt(&staging),
         Err(err) => {
             let _ = fs::remove_dir_all(&staging);
-            Err(format!("cannot move the engine into {}: {err}", dir.display()))
+            Err(format!(
+                "cannot move the engine into {}: {err}",
+                dir.display()
+            ))
         }
     }
 }
@@ -497,7 +523,11 @@ impl Crc32 {
         for &byte in data {
             let mut c = (state ^ byte as u32) & 0xFF;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
             }
             state = c ^ (state >> 8);
         }
@@ -598,6 +628,9 @@ mod tests {
         for bad in ["", "/abs", "..", "a/../b", "C:/x", "a\\b", "a//b", "./a"] {
             assert!(safe_relative(bad).is_err(), "{bad:?} should be refused");
         }
-        assert_eq!(safe_relative("locales/en-US.pak").unwrap(), Path::new("locales").join("en-US.pak"));
+        assert_eq!(
+            safe_relative("locales/en-US.pak").unwrap(),
+            Path::new("locales").join("en-US.pak")
+        );
     }
 }

@@ -27,7 +27,8 @@ fn main() {
         res.set("ProductName", "WhatsApp Rs");
         res.set("FileDescription", "WhatsApp Web as a small tray app");
         res.set("LegalCopyright", "MIT License");
-        res.compile().expect("failed to compile the Windows resource (is rc.exe on PATH?)");
+        res.compile()
+            .expect("failed to compile the Windows resource (is rc.exe on PATH?)");
 
         // Delay-load libcef.dll, which is what makes v0.2.0's single executable possible.
         //

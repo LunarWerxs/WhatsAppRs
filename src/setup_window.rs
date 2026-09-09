@@ -118,7 +118,14 @@ fn run(done: Arc<AtomicU64>, total: u64, stop: Arc<AtomicBool>) {
     }
 
     let class = w!("WhatsAppRsSetup");
-    let icon = unsafe { LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)) }.unwrap_or_default();
+    // `PCWSTR(1 as *const u16)` is MAKEINTRESOURCE(1): Win32 passes small integer resource
+    // IDs in the pointer slot, and 1 is the icon build.rs compiles into the exe. It is not a
+    // pointer at all, which is why clippy's suggestion here is actively wrong -
+    // `std::ptr::dangling::<u16>()` is the ALIGNMENT of u16, i.e. 2, so taking it would
+    // silently ask for a different resource and lose the window icon.
+    #[allow(clippy::manual_dangling_ptr)]
+    let icon =
+        unsafe { LoadIconW(Some(instance.into()), PCWSTR(1 as *const u16)) }.unwrap_or_default();
     let wc = WNDCLASSW {
         lpfnWndProc: Some(wnd_proc),
         hInstance: instance.into(),
@@ -126,9 +133,11 @@ fn run(done: Arc<AtomicU64>, total: u64, stop: Arc<AtomicBool>) {
         hIcon: icon,
         hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
         hbrBackground: HBRUSH(
-            unsafe { windows::Win32::Graphics::Gdi::GetSysColorBrush(
-                windows::Win32::Graphics::Gdi::COLOR_WINDOW,
-            ) }
+            unsafe {
+                windows::Win32::Graphics::Gdi::GetSysColorBrush(
+                    windows::Win32::Graphics::Gdi::COLOR_WINDOW,
+                )
+            }
             .0,
         ),
         ..Default::default()
@@ -207,7 +216,14 @@ fn run(done: Arc<AtomicU64>, total: u64, stop: Arc<AtomicBool>) {
         };
         if let Ok(child) = child {
             if !font.is_invalid() {
-                unsafe { SendMessageW(child, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1))) };
+                unsafe {
+                    SendMessageW(
+                        child,
+                        WM_SETFONT,
+                        Some(WPARAM(font.0 as usize)),
+                        Some(LPARAM(1)),
+                    )
+                };
             }
         }
     };
@@ -258,11 +274,9 @@ fn run(done: Arc<AtomicU64>, total: u64, stop: Arc<AtomicBool>) {
             }
         }
         if let Ok(bar) = bar {
-            let pos = if total == 0 {
-                0
-            } else {
-                (done.load(Ordering::Relaxed).min(total) * 1000 / total) as usize
-            };
+            let pos = (done.load(Ordering::Relaxed).min(total) * 1000)
+                .checked_div(total)
+                .unwrap_or(0) as usize;
             unsafe { SendMessageW(bar, PBM_SETPOS, Some(WPARAM(pos)), None) };
         }
         if stop.load(Ordering::SeqCst) {
