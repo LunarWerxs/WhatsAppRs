@@ -13,7 +13,10 @@ whatsapp-rs is a small native Windows tray app that shows web.whatsapp.com insid
 _The intricacies worth remembering: the gotchas, the half-built parts, the decisions whose
 reason lives nowhere else. Odin never overwrites this section._
 
-- This public repo tracks NEXT_PROMPT.md at its root, which GitHub serves and which publishes machine paths and the owner's name - flagged open, unresolved as of 2026-09-09. anchors: `docs/todo/TODO.md:23`
+- ⛔ NEVER ship Chromium's `--in-process-gpu` (or `--single-process`, which implies it). It makes `viz::GpuServiceImpl::MaybeExitOnContextLost` return early, deleting Chromium's context-loss crash counter and its automatic fallback to software rendering, so a routine GPU driver reset retries forever. It did: 244 GB of log, 10.9 GB of RAM and 8.3 CPU-hours on 2026-09-09. `cargo test` guards it. anchors: `src/cef_view.rs:602`, `DECISIONS.md:306`
+- The app caps its own engine log and watches its own process tree, because CEF neither rotates nor caps `cef.log` and nothing here reported the runaway above. It truncates rather than deletes: Chromium holds the log with no FILE_SHARE_DELETE, so a delete is refused while it runs. anchors: `src/watchdog.rs:1`
+- The software-rendering DLLs (`vk_swiftshader.dll` and friends) are NOT optional in the bundle: they are what the out-of-process GPU falls back to, and an empty fallback stack makes Chromium stop the browser process instead. anchors: `tools/bundle.ps1:1`
+- The handoff notes are no longer published: `NEXT_PROMPT.md` moved to the gitignored `docs/todo/` on 2026-09-09, and history was deliberately not rewritten because the file held nothing secret. anchors: `DECISIONS.md:371`
 - Quitting cleanly (tray Quit or --quit) lets Chromium flush cookies/IndexedDB; killing the process instead can lose the WhatsApp login and force a QR re-scan. anchors: `src/cef_view.rs:351`
 - Notification permission is pre-granted only for web.whatsapp.com (any other origin is denied) so Notification.permission reads granted from first paint without a real prompt. anchors: `src/cef_view.rs:820`
 - Camera/mic access is auto-granted to the WhatsApp origin so a call can start; official CEF ships without H.264, so a call that won't fall back to VP8/VP9/AV1 may not connect video. anchors: `src/cef_view.rs:1012`
