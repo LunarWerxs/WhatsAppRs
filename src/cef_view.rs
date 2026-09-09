@@ -22,7 +22,7 @@
 //!    and then `on_context_initialized` - which CEF runs on its own thread - creates the
 //!    browser as a child of that handle.
 
-use crate::{geometry, notify, paths, settings, shortcut, single_instance, tray, APP_ID};
+use crate::{geometry, notify, paths, settings, shortcut, single_instance, tray, watchdog, APP_ID};
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, Ordering};
@@ -117,6 +117,10 @@ pub(crate) fn run(engine: &crate::engine::Engine) -> Result<(), String> {
     let _ = shortcut::ensure(APP_ID);
 
     let data_dir = paths::data_dir();
+    // Before anything opens the log, and only here in the browser process: clears last
+    // run's log files, then watches this run's from the tick below. See watchdog.rs, and
+    // the 244 GB it exists because of.
+    let mut watchdog = watchdog::Watchdog::arm(&data_dir);
     let mut store = geometry::Store::new(&data_dir);
     let saved = store.load();
 
@@ -178,8 +182,12 @@ pub(crate) fn run(engine: &crate::engine::Engine) -> Result<(), String> {
         cache_path: CefString::from(&*data_dir.join("cef").to_string_lossy()),
         persist_session_cookies: 1,
         locale: CefString::from("en-US"),
+        // WARNING and a file, still: this log is what made the 2026-09-09 fault
+        // diagnosable at all, and CEF writes to `debug.log` beside the executable if it
+        // is given no path, which is worse than writing to one we watch. What changed is
+        // that something now watches it - CEF itself neither rotates nor caps.
         log_severity: LogSeverity::WARNING,
-        log_file: CefString::from(&*data_dir.join("cef.log").to_string_lossy()),
+        log_file: CefString::from(&*watchdog::log_path(&data_dir).to_string_lossy()),
         ..Default::default()
     };
     // The bundled runtime lives in the folder the exe unpacked itself into (or beside the
@@ -326,6 +334,10 @@ pub(crate) fn run(engine: &crate::engine::Engine) -> Result<(), String> {
 
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 next_tick = Instant::now() + TICK;
+                // A stat and a memory counter. The one tick's work that can never be
+                // skipped: it is the only thing standing between a fault loop and the
+                // user's system drive.
+                watchdog.tick();
                 if window.is_visible() {
                     record_geometry(&window, &mut store);
                 }
@@ -381,6 +393,72 @@ fn runtime_style() -> RuntimeStyle {
     }
 }
 
+/// At most this many toasts in any [`TOAST_WINDOW`], however many the page asks for.
+///
+/// Thirty a minute is already more than anyone reads, and a genuine loop - a broken page
+/// script or a service worker replaying pushes - runs thousands a second, so the margin
+/// between "busy group chat" and "runaway" is about four orders of magnitude. This is the
+/// same defect the GPU switch had, on the notification pipe: an unbounded path driven by
+/// something we do not control. Found while auditing for others like it, 2026-09-09.
+const TOAST_BURST: u32 = 30;
+const TOAST_WINDOW: Duration = Duration::from_secs(60);
+
+/// Guards the burst counter. `raise_toast` runs on CEF's UI thread, not ours.
+static TOAST_GATE: Mutex<ToastGate> = Mutex::new(ToastGate {
+    window_start: None,
+    raised: 0,
+    dropped: 0,
+    reported: false,
+});
+
+struct ToastGate {
+    window_start: Option<Instant>,
+    raised: u32,
+    dropped: u32,
+    /// Whether the user has been told, once, that notifications are being held back. The
+    /// `eprintln!` below goes nowhere in a release build - `windows_subsystem = "windows"`
+    /// means there is no console - so without this, suppressing somebody's messages would be
+    /// completely invisible to them. Silent throttling of a messaging app is its own defect.
+    reported: bool,
+}
+
+enum ToastVerdict {
+    Allow,
+    Drop,
+    /// Drop, and raise one plain-language notice in its place. Happens once per run.
+    DropAndSaySo,
+}
+
+fn toast_verdict() -> ToastVerdict {
+    let Ok(mut gate) = TOAST_GATE.lock() else {
+        // A poisoned lock must not silence a messaging app.
+        return ToastVerdict::Allow;
+    };
+    let now = Instant::now();
+    match gate.window_start {
+        Some(start) if now.duration_since(start) < TOAST_WINDOW => {}
+        _ => {
+            if gate.dropped > 0 {
+                eprintln!("[whatsapp-rs] dropped {} toasts over the burst limit", gate.dropped);
+            }
+            gate.window_start = Some(now);
+            gate.raised = 0;
+            gate.dropped = 0;
+        }
+    }
+    if gate.raised < TOAST_BURST {
+        gate.raised += 1;
+        return ToastVerdict::Allow;
+    }
+    gate.dropped += 1;
+    if gate.reported {
+        ToastVerdict::Drop
+    } else {
+        gate.reported = true;
+        ToastVerdict::DropAndSaySo
+    }
+}
+
 /// Draw the toast the page asked for.
 ///
 /// Deliberately a hand-rolled two-field parse rather than pulling serde in for it: the
@@ -403,6 +481,20 @@ fn raise_toast(payload: &str) {
     let title = field(payload, "title").unwrap_or("WhatsApp");
     let body = field(payload, "body").unwrap_or_default();
     eprintln!("[whatsapp-rs] toast {title:?} / {body:?}");
+    // The lock is released before anything is drawn: `notify::toast` is a blocking call into
+    // Windows, and it has no business happening under a mutex that every notification takes.
+    match toast_verdict() {
+        ToastVerdict::Allow => {}
+        ToastVerdict::Drop => return,
+        ToastVerdict::DropAndSaySo => {
+            notify::toast(
+                "WhatsApp Rs",
+                "WhatsApp Web is asking for more notifications than anyone could read, so they \
+                 are being held back for now. Reload from the tray menu if that looks wrong.",
+            );
+            return;
+        }
+    }
     notify::toast(
         if title.is_empty() { "WhatsApp" } else { title },
         body,
@@ -534,6 +626,70 @@ struct HostState {
     browsers: usize,
 }
 
+/// Switches appended to the BROWSER process command line, and the reason each one is here.
+///
+/// Hoisted out of `on_before_command_line_processing` so a test can read it, and that is not
+/// tidiness. `in-process-gpu` sat in this list for two days and cost a 244 GB log file, 10.9 GB
+/// of RAM and 8.3 CPU-hours (DECISIONS.md #24), and nothing in this repository could have
+/// noticed it was there. `in_process_gpu_is_never_shipped` below now fails in milliseconds if
+/// it or `single-process` comes back.
+const BROWSER_SWITCHES: &[&str] = &[
+    "disable-background-networking",
+    "disable-breakpad",
+    "disable-component-update",
+    "disable-domain-reliability",
+    "disable-sync",
+    "no-pings",
+    "no-default-browser-check",
+    "no-first-run",
+    // The process trim, measured 2026-09-07 across five configurations:
+    // 7 processes and 550 MB stock, 5 processes and 501 MB with these two plus
+    // `in-process-gpu`.
+    //
+    // ⛔ `in-process-gpu` WAS HERE AND IS GONE. It cost 32 MB and one process,
+    // and on 2026-09-09 it cost a 244 GB log file, 10.9 GB of RAM and 8.3
+    // CPU-hours in a single unbounded loop. The switch moves Chromium's GPU
+    // service onto a thread of this process, and
+    // `viz::GpuServiceImpl::MaybeExitOnContextLost` opens with, in effect,
+    // "if we are in the host process, we cannot restart the GPU process, so
+    // just hope for recovery" - and returns. That early return IS Chromium's
+    // circuit breaker being switched off. Out of process, the same context
+    // loss makes the GPU process exit, `GpuProcessHost::RecordProcessCrash`
+    // counts it, and after about three crashes Chromium falls back to
+    // SwiftShader for the rest of the session. In process there is no process
+    // to exit, no counter, and no fallback: when an NVIDIA driver reset took
+    // the D3D11 device away at 04:10:37, `eglCreateContext` was retried about
+    // seven thousand times a second for the next eight hours and forty-five
+    // minutes. Full evidence in the incident report; the backstop that bounds
+    // the damage if this ever happens again is `watchdog.rs`.
+    //
+    // `WHATSAPP_RS_CEF_SWITCHES=in-process-gpu` still reaches it, for a
+    // measurement run only. It must not come back.
+    //
+    // Still NOT here: `--disable-gpu`. It saved slightly more and drops
+    // Chromium onto a software rasteriser, which is the shape of the mistake
+    // the Servo round made - a memory "win" that cost the frame rate. Software
+    // rendering is where Chromium ends up on its own after three real GPU
+    // failures, which is the right time to arrive there and not before.
+    //
+    // Deliberately NOT here: `--single-process`, which measures 352 MB in one
+    // process. The owner ruled it out (2026-09-07) and he is right to: it is
+    // unsupported by Chromium and a renderer crash takes the whole app down
+    // instead of showing an error page. Note that it implies `in-process-gpu`
+    // and so carries the same defect.
+    //
+    // Also not here: `--enable-low-end-device-mode`. It was 4 MB better than
+    // this set and doubled the time to first paint, and it shrinks tile and
+    // cache budgets in ways that would show up on a long chat list rather than
+    // on the login page this was measured against.
+    "process-per-site",
+];
+
+/// Switches that put Chromium's GPU service on a thread of this process, which deletes its
+/// own context-loss circuit breaker. Neither may ever appear in [`BROWSER_SWITCHES`]; both
+/// stay reachable through `WHATSAPP_RS_CEF_SWITCHES` for a measurement run, loudly.
+const GPU_IN_HOST_SWITCHES: &[&str] = &["in-process-gpu", "single-process"];
+
 wrap_app! {
     pub struct HostApp {
         client: RefCell<Option<Client>>,
@@ -564,39 +720,10 @@ wrap_app! {
                 return;
             }
             // A single-site viewer needs none of Chrome's own services. Every one of
-            // these is measured in the sweep rather than assumed to help.
-            for switch in [
-                "disable-background-networking",
-                "disable-breakpad",
-                "disable-component-update",
-                "disable-domain-reliability",
-                "disable-sync",
-                "no-pings",
-                "no-default-browser-check",
-                "no-first-run",
-                // The process trim, measured 2026-09-07 across five configurations:
-                // 7 processes and 550 MB stock, 5 processes and 501 MB with these three.
-                //
-                // `in-process-gpu` and NOT `disable-gpu`: disabling the GPU also saved
-                // memory, but it drops Chromium onto a software rasteriser, which is the
-                // shape of the mistake the Servo round made - a memory "win" that cost the
-                // frame rate. In-process GPU keeps the Direct3D11 path and merely stops it
-                // being a separate process; `tools/gfx-probe.js` confirms the real adapter
-                // is still in use afterwards.
-                //
-                // Deliberately NOT here: `--single-process`, which measures 352 MB in one
-                // process. The owner ruled it out (2026-09-07) and he is right to: it is
-                // unsupported by Chromium and a renderer crash takes the whole app down
-                // instead of showing an error page.
-                //
-                // Also not here: `--enable-low-end-device-mode`. It was 4 MB better than
-                // this set and doubled the time to first paint, and it shrinks tile and
-                // cache budgets in ways that would show up on a long chat list rather than
-                // on the login page this was measured against.
-                "in-process-gpu",
-                "process-per-site",
-            ] {
-                cmd.append_switch(Some(&CefString::from(switch)));
+            // these is measured in the sweep rather than assumed to help; the list and the
+            // reasoning are at BROWSER_SWITCHES.
+            for switch in BROWSER_SWITCHES {
+                cmd.append_switch(Some(&CefString::from(*switch)));
             }
             cmd.append_switch_with_value(
                 Some(&CefString::from("renderer-process-limit")),
@@ -613,6 +740,27 @@ wrap_app! {
             // Extra switches for a measurement run, so a sweep needs no rebuild.
             if let Ok(extra) = std::env::var("WHATSAPP_RS_CEF_SWITCHES") {
                 for part in extra.split(',').filter(|s| !s.trim().is_empty()) {
+                    // `trim_start_matches('-')`: typing `--in-process-gpu` is the natural
+                    // habit from a Chromium command line, and without this the guard below
+                    // misses it - a silent bypass of the mechanism built to stop exactly
+                    // that. `append_switch` adds the dashes itself, so both spellings work.
+                    let key = part
+                        .split_once('=')
+                        .map(|(k, _)| k)
+                        .unwrap_or(part)
+                        .trim()
+                        .trim_start_matches('-');
+                    // Deliberate is fine. SILENT is not: a stale environment variable or a
+                    // shortcut somebody made during a sweep would otherwise re-arm the
+                    // 2026-09-09 defect with nothing anywhere saying so.
+                    if GPU_IN_HOST_SWITCHES.contains(&key) {
+                        eprintln!(
+                            "[whatsapp-rs] ⛔ WHATSAPP_RS_CEF_SWITCHES is re-enabling --{key}. \
+                             That puts Chromium's GPU on a thread of this process and removes \
+                             its context-loss circuit breaker; a GPU driver reset then runs \
+                             away unbounded. Measurement runs only. See DECISIONS.md #24."
+                        );
+                    }
                     match part.split_once('=') {
                         Some((k, v)) => cmd.append_switch_with_value(
                             Some(&CefString::from(k.trim())),
@@ -1029,6 +1177,44 @@ wrap_permission_handler! {
                 callback.cancel();
             }
             1
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BROWSER_SWITCHES, GPU_IN_HOST_SWITCHES};
+
+    /// The check this repository did not have on 2026-09-07, and the whole reason
+    /// `BROWSER_SWITCHES` is a named constant instead of an array literal inside a closure.
+    ///
+    /// `in-process-gpu` shipped for two days. It moves Chromium's GPU service onto a thread
+    /// of the browser process, and `viz::GpuServiceImpl::MaybeExitOnContextLost` returns
+    /// early when the service is in the host process - so a fatal context loss is never
+    /// counted, the GPU is never restarted, and the fallback to software rendering never
+    /// happens. A driver reset then retried `eglCreateContext` about seven thousand times a
+    /// second for eight and three quarter hours: 244 GB of log, 10.9 GB of RAM, 8.3
+    /// CPU-hours. `single-process` implies the same thing and is banned with it.
+    #[test]
+    fn in_process_gpu_is_never_shipped() {
+        for banned in GPU_IN_HOST_SWITCHES {
+            assert!(
+                !BROWSER_SWITCHES.contains(banned),
+                "--{banned} is back in BROWSER_SWITCHES. It deletes Chromium's context-loss \
+                 circuit breaker; see DECISIONS.md #24 and the incident report."
+            );
+        }
+    }
+
+    /// `append_switch` adds the dashes itself, so a leading `--` here becomes `----gpu` and
+    /// Chromium silently ignores it - a switch that reads as present and does nothing.
+    #[test]
+    fn browser_switches_carry_no_leading_dashes() {
+        for switch in BROWSER_SWITCHES {
+            assert!(
+                !switch.starts_with('-'),
+                "{switch:?} carries its own dashes; append_switch adds them"
+            );
         }
     }
 }

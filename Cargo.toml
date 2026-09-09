@@ -1,6 +1,6 @@
 [package]
 name = "whatsapp-rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "WhatsApp Web as a small native tray app, on a Chromium we ship"
 
@@ -60,6 +60,12 @@ features = [
   # engine.rs: SetDllDirectoryW, and the LoadLibraryExW that pulls chrome_elf.dll and the
   # delay-loaded libcef.dll out of the unpacked engine folder.
   "Win32_System_LibraryLoader",
+  # watchdog.rs: GetProcessMemoryInfo over this process and, through a one-level Toolhelp32
+  # walk, the engine children it spawned - which is how the app notices its own memory
+  # running away. See the 2026-09-09 incident.
+  "Win32_System_ProcessStatus",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
   # setup_window.rs: the progress bar (InitCommonControlsEx, PROGRESS_CLASSW), the system UI
   # font its two lines are drawn in, and the DPI it scales itself by.
   "Win32_UI_Controls",

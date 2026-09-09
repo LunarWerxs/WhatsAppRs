@@ -5,11 +5,15 @@
 //! a native-protocol client with its own hand-drawn chat window - was built, measured against
 //! this, and deleted. FINDINGS.md and DECISIONS.md keep the numbers; `git log` keeps the code.
 //!
-//! Measured on 2026-09-07, logged out, whole process tree, four minutes after the page loads:
+//! Logged out, whole process tree, four minutes after the page loads, three runs, median.
+//! This app's row is 2026-09-09, after `--in-process-gpu` was reversed (DECISIONS.md #24); the
+//! rest are 2026-09-07 and that change does not touch them. The old row here read
+//! "7 / 560 MB / 376 MB", which was the untrimmed configuration and had been stale since the
+//! switch sweep landed - it is corrected rather than merely updated.
 //!
 //! | | processes | RAM | private | CPU over 4 min |
 //! |---|---|---|---|---|
-//! | this app | 7 | 560 MB | 376 MB | 11 s |
+//! | this app | 6 | 518 MB | 350 MB | 10 s |
 //! | bundled Firefox (deleted) | 10 | 1115 MB | 1040 MB | 149 s |
 //! | the OS webview, Edge's engine (deleted) | 3 | 372 MB | 198 MB | 11 s |
 //! | plain Chrome, what the old C# app drove | 10 | 800 MB | 571 MB | 12 s |
@@ -35,6 +39,7 @@ mod setup_window;
 mod shortcut;
 mod single_instance;
 mod tray;
+mod watchdog;
 
 fn main() {
     // CEF re-runs THIS executable for its render, GPU and utility processes, marking each one

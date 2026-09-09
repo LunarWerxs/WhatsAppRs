@@ -8,6 +8,11 @@ reuse it.
 
   .\build.ps1              # release build -> target\release\whatsapp.exe
   .\build.ps1 -Check       # cargo check only, no link
+  .\build.ps1 -Test        # the unit tests: the switch-list guard and the log-cap logic
+
+`-Test` links a test harness that makes no CEF call, so the linker says
+`LNK4199: /DELAYLOAD:libcef.dll ignored; no imports found`. That warning is correct and
+expected there, and it does not appear for a real build.
 
 **The MAX_PATH trap, kept written down because it reads like a broken toolchain.** cmake's
 compiler probe writes
@@ -19,6 +24,7 @@ something short instead of debugging the compiler.
 #>
 param(
     [switch]$Check,
+    [switch]$Test,
     [string]$TargetDir,
     [string]$CefPath = "$env:USERPROFILE\.local\share\cef"
 )
@@ -39,11 +45,13 @@ $env:PATH = "$cmake;$ninja;$env:PATH"
 if ($TargetDir) { $env:CARGO_TARGET_DIR = $TargetDir }
 
 Set-Location (Split-Path $PSScriptRoot)
-if ($Check) { cargo check --release } else { cargo build --release }
+if ($Check) { cargo check --release }
+elseif ($Test) { cargo test --release }
+else { cargo build --release }
 $code = $LASTEXITCODE
 if ($code -ne 0) { exit $code }
 
-if (-not $Check) {
+if (-not $Check -and -not $Test) {
     $out = if ($TargetDir) { Join-Path $TargetDir 'release' } else { Join-Path (Split-Path $PSScriptRoot) 'target\release' }
     $exe = Join-Path $out 'whatsapp.exe'
     "built  : $exe  ($([math]::Round((Get-Item $exe).Length/1MB,1)) MB)"

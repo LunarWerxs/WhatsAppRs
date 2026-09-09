@@ -915,11 +915,19 @@ reported itself ready:
 | --- | --- | --- | --- | --- |
 | none (the feature-disabling set only) | 7 | 550 MB | 380 MB | 3.3 s |
 | `in-process-gpu` | 6 | 518 MB | 361 MB | 3.3 s |
-| **+ `renderer-process-limit=1` + `process-per-site`** | **5** | **501 MB** | 366 MB | 3.3 s |
+| ~~+ `renderer-process-limit=1` + `process-per-site`~~ | ~~5~~ | ~~501 MB~~ | ~~366 MB~~ | ~~3.3 s~~ |
 | + `enable-low-end-device-mode` | 5 | 497 MB | 361 MB | 6.6 s |
 | + network service in-process | 5 | 507 MB | 373 MB | 3.3 s |
 
-The third row ships. The fourth was 4 MB better and doubled time-to-first-paint, and it shrinks
+⛔ **The third row shipped and was reversed on 2026-09-09. `in-process-gpu` is out.** It cost a
+244 GB log file, 10.9 GB of RAM and 8.3 CPU-hours in one unbounded loop, and when the switch was
+finally measured against the thing it was traded for, it was not even buying the megabytes: see
+*A GPU reset turned this into a runaway* at the end of this file. Everything below in this
+section is what was believed on 2026-09-07 and is left standing because the reasoning is the
+interesting part - it is correct about every number it took and it never asked what the switch
+was load-bearing for.
+
+The third row shipped. The fourth was 4 MB better and doubled time-to-first-paint, and it shrinks
 tile and cache budgets in ways that would show on a long chat list rather than on the login page
 it was measured against, so it is not worth 4 MB.
 
@@ -1249,3 +1257,141 @@ because two of them were the kind that never shows up in a passing test:
 Disk after first run is the same ~350 MB and memory is identical, because it is the same engine.
 This bought the download and the double-click, nothing else. Meta ships the same trick inside an
 MSIX.
+
+---
+
+# A GPU reset turned this into a runaway, 2026-09-09
+
+The worst defect this project has had, and the most useful, because it was caused by a decision
+that every number in this file supported.
+
+## What happened
+
+At **04:10:37** an NVIDIA driver reset (`nvlddmkm` event 153) took the D3D11 device away. Five
+seconds later CEF's GPU thread saw `DXGI_ERROR_DEVICE_REMOVED` and started rebuilding the
+context. It never stopped. Measured live **8 h 45 m later**, while it was still running:
+
+| | at capture | rate |
+| --- | --- | --- |
+| `cef.log` | **243,629,516,234 bytes** (244 GB) | +8.54 MB/s, 28.6 GiB/hour |
+| browser process, private | **10.9 GB** | +1.18 GB/hour |
+| CPU | 43,530 s burned, one thread holding 8.3 CPU-hours | 1.41 cores, continuously |
+
+C: went to **69.2 GB free of 930.6 GB (7.4%)**, about 2.4 hours from full. All three rates
+extrapolate back to the same second, so there was one cause. 95% of the private memory sat in a
+single PartitionAlloc reservation, which places the leak inside `libcef.dll` and not in any Rust
+here. The six-line log cycle repeated roughly **seven thousand times a second** and ended with
+`ContextResult::kFatalFailure` - Chromium telling itself the failure was not retryable, while
+retrying it.
+
+It was found because the owner noticed the RAM figure. Nothing in the app reported anything.
+
+## Why it never recovered, and it is one line of upstream source
+
+`viz::GpuServiceImpl::MaybeExitOnContextLost` (`components/viz/service/gl/gpu_service_impl.cc`)
+begins by asking whether the GPU service is running in the host process, and returns if it is -
+the upstream comment says the GPU process cannot be restarted from inside itself, so it will just
+hope for recovery. Otherwise it calls `RestartGpuProcessForContextLoss`, the GPU process exits,
+`GpuProcessHost::RecordProcessCrash` counts it, and after about three the browser falls back to
+SwiftShader for the rest of the session (`content/browser/gpu/fallback.md`).
+
+`--in-process-gpu` makes that first branch true. **It did not weaken Chromium's GPU recovery, it
+deleted it.** There was then no process to exit, no counter, and no fallback - only
+`eglCreateContext`, forever.
+
+This was verified against Chromium's own source before anything was changed, and separately
+attacked by a reviewer whose job was to refute it, who could not.
+
+## What the switch was actually worth, measured A/B on the same afternoon
+
+First a direct A/B, two runs each, same machine and same session, sampled 60 s after ready:
+
+| configuration | processes | working set | private | ready |
+| --- | --- | --- | --- | --- |
+| out of process | 6 | 510 MB | 360 MB | 3.25 s |
+| `in-process-gpu` | 5 | 490 MB | 357 MB | 3.2 s |
+
+Then the shipped configuration on the full method - three runs, sampled at 240 s, against the
+recorded three-run figures for the two builds that carried the switch:
+
+| configuration | runs | processes | working set @240s | private @240s | ready | ws spread |
+| --- | --- | --- | --- | --- | --- | --- |
+| **`v0.2.1-oop-gpu`, shipped from 2026-09-09** | 3 | **6** | **518 MB** | 350 MB | 3.3 s | 517-520 |
+| `v0.2.0`, with the switch | 3 | 5 | 495 MB | 349 MB | 3.2 s | 492-501 |
+| `final`, with the switch | 3 | 5 | 490 MB | 347 MB | 3.3 s | 483-504 |
+
+**One process and about 28 MB of working set.** Private bytes are unchanged - 350 MB against
+347 and 349, well inside the spread this file has always insisted on reading before believing a
+difference - and frame timing is identical at 120.2 fps and an 8.3 ms median. The working-set
+spreads do not overlap, so that 28 MB is real and it is the whole price. That is the entire
+purchase the 2026-09-07 sweep made, and what it cost was 244 GB, 10.9 GB and 8.3 CPU-hours.
+
+**The lesson is not "the sweep was sloppy".** The sweep was careful, repeated its runs, read its
+spreads and checked the adapter string afterwards so a memory win could not secretly be a
+software rasteriser. It measured everything it set out to measure. It never asked what the switch
+was *load-bearing for*, and no instrument in this repository could have told it, because
+everything here ran for four minutes against a login page and nothing ever broke anything on
+purpose.
+
+## What was changed
+
+1. **`in-process-gpu` is out** of `BROWSER_SWITCHES` in `src/cef_view.rs`, which is now a named
+   constant precisely so a test can read it. `cargo test` fails in milliseconds if it or
+   `single-process` comes back, and setting either through `WHATSAPP_RS_CEF_SWITCHES` prints a
+   loud line rather than silently re-arming the defect.
+2. **`src/watchdog.rs`** caps `cef.log` at 16 MiB on the event loop's existing 1.5 s tick. It
+   keeps the first capful as `cef.log.onset`, because the root cause above came from the *head*
+   of that file and a plain truncate destroys it. It raises one toast per reason per run when the
+   log is being written at megabytes a second or the process tree passes 3 GiB of private commit.
+   It measures **the tree, not this process** - taking the GPU back out of process is exactly
+   what would move the next runaway into a child and blind a watchdog that only looked at itself.
+   It does **not** restart or quit: killing Chromium skips the cookie flush and costs the login.
+3. It **truncates and never deletes**, and that had to be checked rather than assumed. Chromium
+   opens the log with `FILE_APPEND_DATA` and `FILE_SHARE_READ | FILE_SHARE_WRITE`, no
+   `FILE_SHARE_DELETE` (`base/logging.cc`, `InitializeLogFileHandle`). A delete is refused while
+   the engine is up; `SetEndOfFile` through a second handle succeeds, and because an append-only
+   handle keeps no position of its own, Chromium's next write lands at the new zero. `soak.ps1`
+   asserts both against the live engine.
+4. **`raise_toast` got a burst limit** (30 a minute). Found while auditing for other unbounded
+   paths driven by something we do not control - it was the same shape on the notification pipe.
+5. **`tools/soak.ps1`** is the regression test that did not exist. Fifteen checks; the first is
+   simply that a `--type=gpu-process` child is there.
+6. **`bundle.ps1` no longer has a `-KeepFallbacks` switch**, because the software-rendering DLLs
+   are what an out-of-process GPU falls back to and are therefore not optional any more. It was
+   off by default, worth 37 MB, and its default output folder is the one the owner's install runs
+   from - so a plain run of it would have shipped the recovery path without its destination, and
+   Chromium stops the browser process when the fallback stack empties. `single-exe.ps1` always
+   passed the flag, so nothing that reached a user was ever wrong.
+
+## What a review pass found afterwards, and it is the interesting part
+
+Five reviewers over the finished patch, each finding then handed to a separate agent whose job
+was to refute it. Two survived, and both are the same shape as the incident itself - **a defence
+that fails silently:**
+
+- **The onset snapshot was deleted on every startup.** Both alarms end with "Quit and reopen
+  WhatsApp", so a user doing exactly what they were told would destroy the only record of the
+  fault they had just been told about, before anyone could read it. It now outlives the process
+  and is overwritten only by the next real fault. `arming_clears_the_log_but_never_the_onset`
+  pins it.
+- **A failed roll was silent.** If emptying the log ever stops working, the cap is the only thing
+  between a firehose and the disk, and there was nothing left. Three consecutive failures now
+  raise their own alarm.
+
+Two more were fixed before the review, from the design pass: the memory probe originally measured
+only this process, which taking the GPU back out of process would have blinded (the soak now
+proves it reads **283 MB across the tree against 39 MB for the browser process alone**); and it
+sampled every 1.5 s, which meant a full-system process snapshot forever, in an app whose entire
+argument is that it is the light way to run WhatsApp.
+
+## What is still open
+
+The ~50 bytes per iteration that leaked inside PartitionAlloc is upstream and now unreachable in
+practice, but deserves a minimal reproduction and a CEF 152 report. And the fix has only been
+proved against a simulated firehose: a real `DXGI_ERROR_DEVICE_REMOVED` needs a genuine driver
+reset (`soak.ps1 -Minutes 30`, then **Ctrl+Shift+Win+B**), which blacks out the whole screen and
+so is left for a person to trigger.
+
+The eight `nvlddmkm` 153 events in three days on that machine are a separate, still-open,
+host-level problem. Nothing here stops them. What it does is make them cost a stutter instead of
+a night.

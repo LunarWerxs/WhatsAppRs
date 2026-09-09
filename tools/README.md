@@ -8,9 +8,9 @@ paths are script-relative.
 
 | script | what it does |
 | --- | --- |
-| `build.ps1 [-Check]` | `cargo build --release` plus the cmake/ninja/MSVC environment the `cef` crate's build script needs. First run downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`. |
-| `bundle.ps1 [-KeepFallbacks]` | Assembles the **shippable** folder - not the build directory, which holds .pdb files, headers, import libraries, 220 locales and a 20 MB CREDITS.html - and reports its real size. Then run the bundle, which is the only way to know the trim is honest rather than a list of files someone guessed were unused. |
-| `single-exe.ps1 [-Codec zstd:22]` | Produces the ONE file v0.2.0 ships: runs `bundle.ps1`, compresses the sixteen engine files into a single zstd frame, and writes `whatsapp.exe` + that frame + a 64-byte footer as one executable. Windows ignores bytes past the end of a PE image, so the result is a normal exe that happens to be 129 MB. |
+| `build.ps1 [-Check] [-Test]` | `cargo build --release` plus the cmake/ninja/MSVC environment the `cef` crate's build script needs. First run downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`. **`-Test` runs the unit tests**, which need no CEF, no GPU and no network and finish in milliseconds: the log-cap and onset-snapshot logic in `watchdog.rs`, and `in_process_gpu_is_never_shipped`, which fails if `--in-process-gpu` or `--single-process` gets back into the shipped switch list. That one is the guard the 2026-09-09 incident bought. |
+| `bundle.ps1` | Assembles the **shippable** folder - not the build directory, which holds .pdb files, headers, import libraries, 220 locales and a 20 MB CREDITS.html - and reports its real size. Then run the bundle, which is the only way to know the trim is honest rather than a list of files someone guessed were unused. The `-KeepFallbacks` switch is **gone** as of 2026-09-09: the software-rendering DLLs are now always included, because they are what Chromium falls back to after a GPU context loss, and this script's default output folder is the one a live install runs from. |
+| `single-exe.ps1 [-Codec zstd:22]` | Produces the ONE file this repo ships: **runs the unit tests**, then `bundle.ps1`, compresses the sixteen engine files into a single zstd frame, and writes `whatsapp.exe` + that frame + a 64-byte footer as one executable. Windows ignores bytes past the end of a PE image, so the result is a normal exe that happens to be 129 MB. The tests gate the release because this repository has no CI, and a guard nobody runs is not a guard; `-SkipTests` exists but wanting it is a smell. |
 | `pack-payload.py <bundle> --measure` | The codec comparison behind that choice, re-runnable: size, ratio, pack time and unpack time for zstd 19/22 and xz 6/9 over the real bundle. zstd:22 won on unpack time, not on size. |
 | `single-test.ps1` | The proof for the single exe, and the only one that counts: copies **only** that file into an empty folder, wipes the profile, starts it twice, and checks it starts with no `libcef.dll` beside it, unpacks 17 files, loads the page, and does **not** unpack again on the second start. |
 | `login.ps1` | Opens the app on the persistent profile so a person can scan the QR, and leaves it running. Everything that matters most - memory with a real mailbox, responsiveness with a real chat list, a real call - needs this first. |
@@ -23,6 +23,22 @@ paths are script-relative.
 | `bench-summary.py [file.jsonl] [--markdown]` | Medians **and the min-max spread**. Read the spread before believing a difference: on the Servo round one build measured 8.5 and 31.2 fps on consecutive runs, and a "memory win" from one sample halved the frame rate and saved nothing. |
 | `chrome-control.ps1` | Plain Chrome, scratch profile, `--app`, measured by exactly the same method. A check on the METHOD, not a proposal: it returned 800.4 MB against the 802.9 MB the old C# wrapper measured a day earlier with a different script. |
 | `official-app.ps1` | Meta's own WhatsApp for Windows, same method. Answers "is the real app lighter?" with a number: no - 1110 MB across 8 processes, and it is a WebView2 shell, so Chromium too. |
+
+## Survive a fault
+
+There was no section here until 2026-09-09, and that is why a GPU driver reset turned the app
+into a 244 GB log file, 10.9 GB of RAM and 8.3 CPU-hours of one spinning thread before anybody
+noticed. Every other instrument above runs for four minutes against a login page; nothing ran
+long, and nothing broke anything on purpose.
+
+| script | what it proves |
+| --- | --- |
+| `soak.ps1 [-Minutes N]` | Fifteen checks over the runaway (twelve with `-Minutes 0`). The first is the root cause: **a `--type=gpu-process` child must exist**, because `--in-process-gpu` is what removed Chromium's context-loss crash counter and its automatic fallback to software rendering. The rest exercise `watchdog.rs` against the real running engine - that Chromium is holding `cef.log` open, that deleting it is refused while it is (which is why the watchdog truncates instead), that passing the cap rolls it back to empty under that open handle, that the onset snapshot survives, that a sustained firehose raises the alarm, that private bytes plateau over the soak, and that `--quit` still works afterwards. `-Minutes 0` runs the structural half in about ninety seconds. |
+
+To exercise the real path rather than the simulated one, start `soak.ps1 -Minutes 30` and press
+**Ctrl+Shift+Win+B** once it is up. That restarts the display driver and delivers a genuine
+`DXGI_ERROR_DEVICE_REMOVED` to the GPU process - the exact fault of 2026-09-09. Everything on
+screen blacks out for a second or two. The app should still be there afterwards.
 
 ## Probe the page
 
@@ -74,7 +90,14 @@ the client.
 ## Two rules for anyone adding to this
 
 - **Never run two measurements at once.** One's process sweep picks up the other's browser. It
-  produced 1673 MB for a build that measures 500, and the number looked entirely plausible.
+  produced 1673 MB for a build that measures 500, and the number looked entirely plausible. It
+  also leaves the loser's processes holding `whatsapp.exe`, and the next `cargo build` then fails
+  with "Access is denied" - which reads as a broken toolchain and is not. `bench.ps1` and
+  `soak.ps1` both refuse to start when a `whatsapp.exe` from a different path is up.
+- **A script must never force-kill a `whatsapp.exe` it did not start.** `Wait-ForExit` does
+  exactly that after 40 seconds, and the owner's real, logged-in instance is a `whatsapp.exe`
+  too. A kill skips Chromium's cookie flush, and the phone has to re-pair. Refuse and say whose
+  process it is; do not clear the way.
 - **Match processes exactly - not by name, not by a parent-child walk.** By name, because Meta's
   app and ours are both `whatsapp.exe`. By tree walk, because a re-parented process leaves an
   orphan whose parent id resolves to something that owns half the machine; that version of

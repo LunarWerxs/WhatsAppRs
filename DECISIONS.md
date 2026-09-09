@@ -300,3 +300,63 @@ run. Proved on a copy of only that file in an empty folder: it starts (delay-loa
 9/9, mute-check PASS, capability-probe unchanged, GPU still hardware. Memory 493.1 MB against
 v0.1.0's 489.6 over three runs each, inside v0.1.0's own spread, so the payload does not stay
 resident. FINDINGS.md #17 has the numbers and the traps.
+
+## 2026-09-09
+
+**24. `--in-process-gpu` is reversed. A memory saving that removes a circuit breaker is not a
+saving.** This is the only entry here that undoes an earlier one, and it is worth reading as
+what it is: the sweep in #17 was correct about every number it measured, and it measured the
+wrong things. It asked what the switch cost in processes and megabytes. It did not ask what the
+switch was load-bearing for.
+
+What it was load-bearing for: `viz::GpuServiceImpl::MaybeExitOnContextLost` begins by checking
+whether the GPU service is in the host process, and if it is, returns - the comment upstream is
+that the GPU process cannot be restarted from inside itself, so it just hopes for recovery.
+Out of process, that same function calls `RestartGpuProcessForContextLoss`, the GPU process
+exits, `GpuProcessHost::RecordProcessCrash` counts it, and after about three the browser falls
+back to SwiftShader for the rest of the session. In process there is no process to exit, no
+counter, and no fallback. `--in-process-gpu` did not weaken Chromium's GPU recovery; it deleted
+it.
+
+On 2026-09-09 at 04:10:37 an NVIDIA driver reset (`nvlddmkm` event 153, the eighth in three
+days on this machine) took the D3D11 device away. `eglCreateContext` was then retried about
+seven thousand times a second for eight hours and forty-five minutes. `cef.log` reached
+**243,629,516,234 bytes** growing at 8.54 MB/s, the browser process reached **10.9 GB** private
+growing at 1.18 GB/hour, and one thread burned 8.3 CPU-hours. The system drive went to 7.4%
+free, about two hours from full. It was found because the owner noticed the RAM figure, not
+because anything in the app reported it.
+
+**Re-measured properly afterwards, three runs at 240 s: 6 processes and 518 MB against the old
+5 and 490.** One process and about 28 MB of working set. Private bytes unchanged - 350 MB against
+347 - and frame timing identical at 120.2 fps. That is what it bought. It is gone, and it must not come back;
+`WHATSAPP_RS_CEF_SWITCHES=in-process-gpu` still reaches it for a measurement and nothing else.
+`process-per-site` and `renderer-process-limit=1` stay - neither has anything to do with this.
+`--single-process` is doubly ruled out now: the owner's ruling in #17 stands, and it implies
+`in-process-gpu`, so it carries this defect as well.
+
+**Two things follow from it that are not the switch.** They matter more than the switch does,
+because the switch was one mistake and these are the reasons a mistake ran for nine hours.
+
+- **CEF's log had no bound and nothing watched it.** Chromium neither rotates nor caps, and the
+  app pointed it at the user's system drive and never looked again. `src/watchdog.rs` now caps
+  it at 16 MiB on the event loop's existing 1.5 s tick, keeps the first capful as
+  `cef.log.onset` because the head of the log is where a root cause lives, and raises one toast
+  the first time the app catches itself writing megabytes a second or holding gigabytes of
+  private memory. It deliberately does **not** restart or quit: a messaging client that shuts
+  itself down on a heuristic is worse than one running hot, and killing Chromium skips the
+  cookie flush and costs the login.
+- **Nothing here ran long or broke anything on purpose.** Every number in this repo came from a
+  four-minute sample on a login page, so no instrument could have seen this. `tools/soak.ps1`
+  is the regression test: fifteen checks, the first of which is simply that a
+  `--type=gpu-process` child exists.
+
+**And a third thing, found while fixing it: the shipped bundle did not carry what the fix falls
+back TO.** `bundle.ps1` had a `-KeepFallbacks` switch, off by default, worth ~37 MB, whose
+reasoning was "this machine has a GPU". Restoring the out-of-process GPU makes Chromium fall back
+to `vk_swiftshader.dll` after about three context-loss failures - and with an empty fallback stack
+Chromium stops the browser process instead. So the recovery this whole entry is about would have
+ended in the app closing rather than in a stutter. The switch is **gone**; those files are always
+included now. `single-exe.ps1` always passed `-KeepFallbacks`, so what actually shipped to people
+was fine - but `bundle.ps1`'s default output folder is `D:\wa-bundle\whatsapp`, which is the
+folder the owner's own install runs from, so one plain run of it would have quietly disarmed a
+live app.

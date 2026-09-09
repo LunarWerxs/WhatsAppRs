@@ -1,13 +1,15 @@
 <#
-Produce the one file v0.2.0 ships: whatsapp.exe with the whole engine inside it.
+Produce the one file this repo ships: whatsapp.exe with the whole engine inside it.
 
   .\build.ps1
-  .\single-exe.ps1                      # -> D:\wa-bundle\whatsapp-rs-0.2.0-windows-x64.exe
+  .\single-exe.ps1                      # -> D:\wa-bundle\whatsapp-rs-<version>-windows-x64.exe
   .\single-exe.ps1 -Codec xz:9          # if the download/first-run trade ever changes
 
 Three steps, and `bundle.ps1` is still the one that decides what the engine consists of:
 
-  1. bundle.ps1 -KeepFallbacks   assembles the 17-file folder, exactly as v0.1.0 shipped it
+  1. bundle.ps1                  assembles the 17-file folder, exactly as v0.1.0 shipped it,
+                                 software-rendering fallback included - since 2026-09-09 that
+                                 is not optional, because it is what Chromium falls back TO
   2. pack-payload.py             compresses everything except whatsapp.exe into one stream
   3.                             writes whatsapp.exe, then the stream, then a 64-byte footer
 
@@ -22,7 +24,8 @@ param(
     [string]$Bundle = 'D:\wa-bundle\whatsapp',
     [string]$Out,
     [string]$Codec = 'zstd:22',
-    [switch]$SkipBundle
+    [switch]$SkipBundle,
+    [switch]$SkipTests
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot
@@ -31,8 +34,18 @@ $version = (Select-String -Path (Join-Path $repo 'Cargo.toml') -Pattern '^versio
             Select-Object -First 1).Matches[0].Groups[1].Value
 if (-not $Out) { $Out = Join-Path (Split-Path $Bundle) "whatsapp-rs-$version-windows-x64.exe" }
 
+# The unit tests gate the RELEASE, because this repository has no CI and a guard nobody runs is
+# not a guard. `in_process_gpu_is_never_shipped` is the one that matters: it fails if
+# `--in-process-gpu` or `--single-process` is back in the shipped switch list, which is the
+# defect that cost 244 GB of log, 10.9 GB of RAM and 8.3 CPU-hours on 2026-09-09. It costs a
+# couple of seconds, and this is the last moment anybody can catch it before strangers get it.
+if (-not $SkipTests) {
+    & (Join-Path $PSScriptRoot 'build.ps1') -Test
+    if ($LASTEXITCODE -ne 0) { throw 'unit tests failed - refusing to pack a release' }
+}
+
 if (-not $SkipBundle) {
-    & (Join-Path $PSScriptRoot 'bundle.ps1') -Out $Bundle -KeepFallbacks
+    & (Join-Path $PSScriptRoot 'bundle.ps1') -Out $Bundle
 }
 $stub = Join-Path $Bundle 'whatsapp.exe'
 if (-not (Test-Path $stub)) { throw "no bundle at $Bundle" }
