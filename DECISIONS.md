@@ -367,3 +367,22 @@ included now. `single-exe.ps1` always passed `-KeepFallbacks`, so what actually 
 was fine - but `bundle.ps1`'s default output folder is `D:\wa-bundle\whatsapp`, which is the
 folder the owner's own install runs from, so one plain run of it would have quietly disarmed a
 live app.
+
+**25. The handoff notes stop being published, and history is NOT rewritten (2026-09-09).**
+Delegated call, made on Michael's "do whatever else you recommend" after the options were put to
+him. `NEXT_PROMPT.md` sat TRACKED at the repository root, so GitHub served it continuously from
+the moment this repo went public: its own headings included "Still open, and both need his phone",
+"Traps this cost, so nobody pays for them twice" and "How Michael wants you to work", plus four
+machine paths and both brothers' first names. That is exactly the candid writing the standing rule
+(2026-08-29, restated 2026-09-09: a public repo does not publish its to-do list) exists to keep
+unpublished.
+
+It has moved to `docs/todo/`, which is gitignored, so it stops being served going forward.
+
+⛔ **History was deliberately NOT rewritten**, and the reasoning matters more than the act. Checked
+first: the file contains **no credentials, no tokens, no email addresses and no phone numbers** -
+it is candid, not sensitive. Rewriting the history of a public repository breaks every clone and
+fork, and it does not retract anything anyway: git has already served it, and GitHub caches, forks
+and archives keep their copies. Paying that cost to un-publish two first names and some `D:\` paths
+would be theatre. If something genuinely secret ever does land here, the answer is different and
+starts with rotating the secret, not with rewriting history.
