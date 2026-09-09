@@ -4,6 +4,8 @@ WhatsApp Web as a small native tray app for Windows, on a Chromium it ships itse
 scratch, no forked code, MIT licensed. Not made by or affiliated with WhatsApp or Meta;
 "WhatsApp" is their trademark and the page it shows is theirs.
 
+[![Discord](https://img.shields.io/badge/Discord-join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/PsWpeNUzhk)
+
 **One executable, no installer, nothing to unzip.** 130 MB to download, 6 processes, 518 MB of
 RAM logged out. Most of that is WhatsApp's own JavaScript, not this wrapper. See "Why it is
 500 MB" below, because that is the question everybody asks and it has a measured answer.
