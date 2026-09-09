@@ -349,6 +349,13 @@ because the switch was one mistake and these are the reasons a mistake ran for n
   four-minute sample on a login page, so no instrument could have seen this. `tools/soak.ps1`
   is the regression test: fifteen checks, the first of which is simply that a
   `--type=gpu-process` child exists.
+- **And nothing ran any of it automatically.** There was no CI in this repository at all, which
+  is the reason a switch could sit in the shipped list for two days. `.github/workflows/ci.yml`
+  now runs formatting, clippy and `cargo test` - which carries
+  `in_process_gpu_is_never_shipped` - on every push, on a Windows runner, on a **pinned**
+  toolchain so that a new clippy release cannot turn it red on its own. The soak is deliberately
+  not in it: ten minutes and a real Chromium is a thing a person runs before shipping. The
+  reasoning lives in the workflow's own comments, beside the thing it governs.
 
 **And a third thing, found while fixing it: the shipped bundle did not carry what the fix falls
 back TO.** `bundle.ps1` had a `-KeepFallbacks` switch, off by default, worth ~37 MB, whose
