@@ -37,7 +37,7 @@ The text below is the original PR write-up, kept as documentation of what each p
 
 # Upstream PR text (historical; see the note above)
 
-Branch: `cache-storage-complete` in `D:\NEWProjects\servo`, four commits on top of `main`
+Branch: `cache-storage-complete` in `D:\.DevScratch\forks\servo`, four commits on top of `main`
 (6c680f538, 2026-09-06). Patch files sit beside this file. All four apply cleanly with
 `git am`, `mach test-tidy` reports no errors, and the storage crate's unit tests pass.
 

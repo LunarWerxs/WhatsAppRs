@@ -1,7 +1,8 @@
 # Building Servo on this Windows box
 
 Every one of these was hit in order on 2026-09-06 and cost a build cycle each. Do them all up
-front. The clone lives at `D:\NEWProjects\servo` (main, shallow 200).
+front. The clone lives at `D:\.DevScratch\forks\servo` (main, shallow 200; moved there
+2026-09-08 from `D:\NEWProjects\servo` - third-party clones live under `.DevScratch\forks`).
 
 ## Prerequisites that were missing or off PATH
 
@@ -26,7 +27,7 @@ front. The clone lives at `D:\NEWProjects\servo` (main, shallow 200).
 ```powershell
 $env:PATH = "C:\Program Files\LLVM\bin;" + (python -c "import sysconfig; print(sysconfig.get_path('scripts', 'nt_user'))") + ";" + $env:PATH
 $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-Set-Location D:\NEWProjects\servo
+Set-Location D:\.DevScratch\forks\servo
 uv run --frozen python mach build --release --media-stack dummy
 ```
 
