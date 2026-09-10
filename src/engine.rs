@@ -126,6 +126,70 @@ pub fn prepare(is_subprocess: bool) -> Result<Engine, String> {
     })
 }
 
+/// Halve the unpacked engine on disk, in place, with Windows' own transparent compression.
+///
+/// **Measured 2026-09-10 on the real engine folder: 345.9 MB becomes 156.0 MB, a 55% cut.
+/// `libcef.dll` alone goes from 271.4 MB to 115.4 MB.** It costs about 4.6 seconds here, once,
+/// on first run only, and it is why first run takes roughly nine seconds instead of four.
+///
+/// **This is NOT the thing that famously does not work.** Packing `libcef.dll` with UPX is on
+/// record on the CEF forum as crashing `cefclient`, and the reason generalises: a packer
+/// decompresses the whole image eagerly into private memory, which destroys the memory-mapping
+/// the loader depends on and turns shared pages into a private copy per process.
+///
+/// WOF ("Windows Overlay Filter", what `compact /exe:LZX` applies and what Compact OS uses on
+/// Windows' own system binaries) is a different mechanism: the file stays an ordinary PE, the
+/// loader memory-maps it exactly as before, and the filter decompresses pages on demand
+/// underneath into the SHARED file cache. That is why the measured cost is what it is:
+///
+/// - working set 566.6 MB compressed against 567.4 MB uncompressed, i.e. **no memory cost**,
+///   measured with the cache flushed and the compressed run going first so any bias worked
+///   against it;
+/// - time to the renderer process +0.27 s, with a wider spread (0.39-0.77 s against a tight
+///   0.29-0.32 s), which is what per-page decompression looks like.
+///
+/// LZX rather than XPRESS: measured on this folder, LZX gives 156.0 MB against XPRESS16K's
+/// 191.9 MB, XPRESS8K's 200.0 MB and XPRESS4K's 214.4 MB, and the startup difference between
+/// modes was inside the run-to-run noise. 36 MB for no measurable extra cost.
+///
+/// `compact.exe` rather than `WofSetFileDataLocation`: the API needs per-file plumbing and a
+/// provider struct, this is one call, Microsoft documents this exact invocation for this exact
+/// purpose, and it is what the numbers above were measured with.
+///
+/// **Best effort, always.** A drive that is not NTFS (a FAT32 memory stick, which the portable
+/// launcher makes a real case), an older Windows, a policy that forbids it, or a missing
+/// `compact.exe` all mean the engine is simply left uncompressed, which is exactly what shipped
+/// before this existed. `WHATSAPP_RS_NO_COMPRESS=1` turns it off for a measurement run.
+#[cfg(target_os = "windows")]
+fn compress_in_place(dir: &Path) {
+    use std::os::windows::process::CommandExt;
+    /// Do not flash a console window on somebody's first run.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    if std::env::var_os("WHATSAPP_RS_NO_COMPRESS").is_some() {
+        return;
+    }
+    let out = std::process::Command::new("compact.exe")
+        .arg("/c")
+        .arg(format!("/s:{}", dir.display()))
+        .arg("/exe:LZX")
+        .arg("/i") // keep going past a file that will not compress
+        .arg("/q")
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => eprintln!("[whatsapp-rs] engine compressed in place"),
+        Ok(o) => eprintln!(
+            "[whatsapp-rs] engine left uncompressed (compact exited {:?})",
+            o.status.code()
+        ),
+        Err(e) => eprintln!("[whatsapp-rs] engine left uncompressed ({e})"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn compress_in_place(_dir: &Path) {}
+
 /// Old versions' engine folders, deleted after a new one has started successfully.
 ///
 /// Not on the startup path: this walks and deletes ~350 MB of files and there is no reason
@@ -364,6 +428,12 @@ fn unpack(exe: &Path, footer: &Footer, root: &Path, dir: &Path) -> Result<(), St
     let window = crate::setup_window::Window::show(done.clone(), total);
 
     let result = extract_all(&mut reader, &entries, &staging, &done);
+    // Compress BEFORE the window closes and BEFORE anything maps these files. Both orderings
+    // matter: `compact` cannot touch a DLL that is already loaded, and doing it after the
+    // window closes would be five seconds of nothing on screen on somebody's first run.
+    if result.is_ok() {
+        compress_in_place(&staging);
+    }
     window.close();
     result.inspect_err(|_| {
         let _ = fs::remove_dir_all(&staging);

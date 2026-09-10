@@ -2,8 +2,8 @@
 //!
 //! # ⛔⛔ THE ENGINE IS OS-AGNOSTIC OR IT IS NOT A CANDIDATE ⛔⛔
 //!
-//! > **"I will never, ever, ever, ever goddamn use a motherfucking browser that is not OS
-//! > agnostic."** - Michael, 2026-09-09 (DECISIONS.md #26, and the banner at the top of it)
+//! > **"I will never, ever, ever use a browser that is not OS agnostic."**
+//! > - Michael, 2026-09-09 (DECISIONS.md #26, and the banner at the top of it)
 //!
 //! **The same engine on Windows, macOS and Linux, or it is out.** Not one engine per platform.
 //! The same one. This is WHY this file bundles CEF and why 271 MB of `libcef.dll` is an accepted

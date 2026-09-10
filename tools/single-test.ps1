@@ -27,8 +27,14 @@ $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\pagescript.ps1"
 
 if (-not $Single) {
-    $Single = (Get-ChildItem 'D:\wa-bundle' -Filter 'whatsapp-rs-*-windows-x64.exe' -File |
+    # `dist\` at the top of the repo, where single-exe.ps1 has written since 2026-09-09. This
+    # used to point at D:\wa-bundle, and after the output moved it silently kept finding the
+    # OLD exe there and testing that instead - a green run proving nothing about the build you
+    # just made. A stale default that still passes is worse than one that fails.
+    $dist = Join-Path (Split-Path $PSScriptRoot) 'dist'
+    $Single = (Get-ChildItem $dist -Filter 'whatsapp-rs-*-windows-x64.exe' -File -ErrorAction SilentlyContinue |
                Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    if (-not $Single) { throw "no packed exe in $dist - run tools\single-exe.ps1 first" }
 }
 if (-not $Single -or -not (Test-Path $Single)) { throw "no packed exe - run tools\single-exe.ps1" }
 
