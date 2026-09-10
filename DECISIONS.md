@@ -9,10 +9,11 @@ alternatives that contradict them. Owner is Michael.
 
 # THE ENGINE MUST BE OS-AGNOSTIC. THE SAME ENGINE ON WINDOWS, MACOS AND LINUX. NO EXCEPTIONS.
 
-> **"I will never, ever, ever, ever goddamn use a motherfucking browser that is not OS
-> agnostic."**
+> **"I will never, ever, ever use a browser that is not OS agnostic."**
 >
 > Michael, 2026-09-09, after WebView2 was raised for the third time across this project.
+> Paraphrased at his request; the original was considerably more emphatic and meant exactly
+> this. Read the "never" four times if the force is not coming through.
 
 **If it does not run on Windows AND macOS AND Linux, it is not a candidate. Do not raise it. Do
 not raise it "just to note the option". Do not raise it because it would be smaller. Do not raise
@@ -419,9 +420,9 @@ would be theatre. If something genuinely secret ever does land here, the answer 
 starts with rotating the secret, not with rewriting history.
 
 **26. ⛔ THE ENGINE IS OS-AGNOSTIC OR IT IS NOT A CANDIDATE. WebView2 is permanently closed
-(2026-09-09).** His words, and the banner at the top of this file carries them in full: *"I will
-never, ever, ever, ever goddamn use a motherfucking browser that is not OS agnostic."* Said after
-WebView2 came up for the third time in this project's life, the third time being mine.
+(2026-09-09).** His words, paraphrased at his own request: *"I will never, ever, ever use a
+browser that is not OS agnostic."* Said after WebView2 came up for the third time in this
+project's life, the third time being mine. He was blunter than that and entitled to be.
 
 **The rule, stated so there is nothing left to interpret:** an engine is only a candidate if the
 SAME engine runs on Windows, macOS and Linux. Not "an engine on each". The same one. Anything
@@ -446,3 +447,76 @@ motivated every re-raise has now been searched to the end and answered: no small
 of rendering web.whatsapp.com exists anywhere, CEF's own maintainer says the size is inherent to
 Chromium, and every wrapper that bundles a real Chromium lands in our band. 271 MB is the price of
 the rule, the price is accepted, and the matter is closed.
+
+**27. 64-bit stays. 32-bit is rejected even though it measurably wins (2026-09-10).** His words
+when it was put to him: *"I wasn't asking you to research 32-bit... I would prefer to stick with
+64."* Recorded because the number is genuinely attractive and someone will find it again.
+
+**The measurement is real and was made by downloading CEF's own windows32 minimal distribution
+and counting bytes**, not estimated: `libcef.dll` is **227.1 MB on 32-bit against 271.4 MB on
+64-bit, 44.3 MB and 16.3% smaller**; `dxcompiler.dll` (24.6 MB) is absent from the 32-bit
+distribution entirely; `chrome_elf.dll` is 1.1 MB smaller. The data files (`resources.pak`,
+`icudtl.dat`, `v8_context_snapshot.bin`) are byte-identical, which is the expected shape, since
+32-bit wins on code and nothing on data. Total: about **70 MB off a 347 MB install, near 20%**.
+
+**Rejected anyway, and the reasons are good ones.** A 32-bit process caps at 4 GB of address
+space, which is a ceiling this app does not have today and which a long chat history plus a video
+call is exactly the case to find. CEF's own maintainer calls 32-bit Windows "effectively a legacy
+platform", so it is the target that gets dropped first. And the missing `dxcompiler.dll` is an
+unproven capability question, not a clean saving.
+
+**Do not re-propose 32-bit for size.** The number is known, it is 70 MB, and the answer is still
+no. Size work continues on 64-bit only.
+
+
+**28. The engine is compressed on disk, in place, on first run. 345.9 MB becomes 156.0 MB
+(2026-09-10).** The owner asked the size question three times and refused two answers that came
+from reasoning rather than measurement. This is what came back with a number attached, and it is
+the only saving of the whole search that survives.
+
+**What ships:** after the payload extracts into its versioned folder, `engine.rs` runs
+`compact.exe /c /s:<dir> /exe:LZX /i /q` on that folder, once, before anything maps the files.
+**190.0 MB saved, 54.9%.** `libcef.dll` alone goes 271.4 MB to 115.4 MB.
+
+**It costs about +0.27 s of startup and no memory at all** - working set 566.6 MB compressed
+against 567.4 MB uncompressed, measured with the page cache flushed and the compressed run going
+FIRST so every cache advantage worked against it. That "no memory" result is the mechanism, not
+luck: WOF decompresses into the SHARED file cache, so pages stay shared across all six processes.
+
+**This is not UPX and the difference is the whole point.** UPX-packing `libcef.dll` is on record
+on the CEF forum as crashing cefclient, because a packer decompresses the image eagerly into
+private memory and destroys the memory-mapping the loader depends on. WOF leaves an ordinary PE
+that the loader maps exactly as before.
+
+**Best effort, always, and silence is the correct failure.** Not NTFS (a FAT32 stick, which
+portable mode makes a real case), an older Windows, a group policy, a missing `compact.exe` - any
+of those and the engine is simply left uncompressed, which is precisely what shipped before this
+existed. `WHATSAPP_RS_NO_COMPRESS=1` turns it off for a measurement run.
+
+**What was rejected and why:** XPRESS16K/8K/4K (191.9 / 200.0 / 214.4 MB against LZX's 156.0, with
+the startup difference between modes inside the noise - 36 MB for nothing); and
+`WofSetFileDataLocation`, because it needs per-file plumbing and a provider struct where this is
+one documented call, and one call is what the numbers above were measured with.
+
+**29. The search for a smaller browser engine is CLOSED, by measurement, not by opinion
+(2026-09-10).** Filed so that the fourth person to ask - and there will be one - gets numbers
+instead of another round of searching. The full working is FINDINGS.md, "The size question,
+measured to the end and closed".
+
+- **No smaller modern `libcef.dll` exists in public.** 80 GitHub repos, every release, every
+  asset, 36 CEF binaries, 0 failed API calls. The one 50.9 MB candidate posted three days earlier
+  is a **2015-era Chromium with zero occurrences of `WebAssembly`** in the binary, so it cannot
+  render WhatsApp Web at all. Everything else is a repackage of the official distribution.
+- **Stripping Google's services is worth 0.2 MB.** ungoogled-chromium's `chrome.dll` against
+  stock Chrome's, same Chromium branch, x64: 284.0 against 284.3 MB. A project whose entire
+  purpose is that removal moves the engine by one part in a thousand.
+- **CEF does not forbid feature-stripping** - an earlier claim in this project that it did was
+  wrong, and `tools/gn_args.py` says so plainly: `GN_DEFINES` is a documented pass-through and
+  the only thing genuinely forced is DRM. The blocker is cost, not permission. Never restate it
+  as permission.
+- **One unmeasured lever remains: `optimize_for_size=true`**, upper bound ~48 MB from a 2016
+  measurement that predates ThinLTO and PGO. Buying it means owning a from-source Chromium build
+  forever, on every CEF bump. **Recommendation: no**, and it is the owner's call to reverse.
+
+**271 MB is the price of the rule in #26, the price is accepted, and re-searching it is not
+work.** If someone wants the last 48 MB, the path is a build project, not another search.

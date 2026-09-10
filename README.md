@@ -6,8 +6,9 @@ scratch, no forked code, MIT licensed. Not made by or affiliated with WhatsApp o
 
 [![Discord](https://img.shields.io/badge/Discord-join_the_community-5865F2?logo=discord&logoColor=white)](https://discord.gg/PsWpeNUzhk)
 
-**One executable, no installer, nothing to unzip.** 130 MB to download, 6 processes, 518 MB of
-RAM logged out. Most of that is WhatsApp's own JavaScript, not this wrapper. See "Why it is
+**One executable, no installer, nothing to unzip.** 130 MB to download, 156 MB on disk after it
+unpacks, 6 processes, 518 MB of RAM logged out. Most of that is WhatsApp's own JavaScript, not
+this wrapper. See "Why it is
 500 MB" below, because that is the question everybody asks and it has a measured answer.
 
 ## Download and run
@@ -19,15 +20,23 @@ RAM logged out. Most of that is WhatsApp's own JavaScript, not this wrapper. See
 That is the whole thing. Put the exe wherever you like; nothing has to sit beside it. Closing the
 window hides it to the tray; right-click the tray icon to quit.
 
-**What the first run does, in about four seconds behind a small "Setting up" window:** it unpacks
-the browser engine it is carrying into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>-<id>`, where
-the id is a short hash of the engine so a rebuilt version cannot be confused with an old one. That
-folder
-is ~350 MB and it stays there. **The single file is the download and the click; it is not a
-smaller program.** Disk after first run and memory while running are exactly what v0.1.0's
-17-file folder cost, because it is the same engine - Chromium exists only as a 271 MB DLL and
-there is no static build of it, so no wrapper can be genuinely smaller. Meta does the same thing
-inside an MSIX. A later version unpacks its own folder and deletes the old one.
+**What the first run does, in about nine seconds behind a small "Setting up" window:** it unpacks
+the browser engine it is carrying into `%LOCALAPPDATA%\WhatsAppRs\engine\<version>-<id>` - the id
+is a short hash of the engine, so a rebuilt version cannot be confused with an old one - and then
+it compresses that folder in place using Windows' own transparent file compression. **The engine
+ends up as 156 MB on disk instead of the 346 MB it unpacked to, and it stays there.**
+
+About five of those nine seconds are the compression, and they are paid once. Afterwards it costs
+roughly a quarter of a second of startup and, measured, **no memory at all** - Windows
+decompresses those pages into the shared file cache, so the six processes still share them.
+`WHATSAPP_RS_NO_COMPRESS=1` skips it, and a drive that cannot do it (not NTFS, an older Windows,
+a policy) simply keeps the uncompressed folder.
+
+**The single file is the download and the click; it is not a smaller program.** Memory while
+running is exactly what v0.1.0's 17-file folder cost, because it is the same engine - Chromium
+exists only as a 271 MB DLL and there is no static build of it, so no wrapper can be genuinely
+smaller. Meta does the same thing inside an MSIX. A later version unpacks its own folder and
+deletes the old one.
 
 Windows 10 or 11, 64-bit. The first run also writes one Start Menu shortcut, `WhatsApp Rs`,
 because Windows will not show toast notifications for a program that has none. Your login and
@@ -42,15 +51,16 @@ a kill can lose the login and cost you another QR scan.
 
 **The download IS the program.** No setup wizard, no Program Files, no registry keys, no uninstall
 entry. Put the exe anywhere and run it. What it writes outside its own folder is exactly two
-things: the engine and your profile under `%LOCALAPPDATA%\WhatsAppRs` (about 390 MB together),
-and one Start Menu shortcut.
+things: the engine and your profile under `%LOCALAPPDATA%\WhatsAppRs` (about 190 MB together,
+because the engine is compressed in place), and one Start Menu shortcut.
 
 **To keep even those in one folder** - a USB stick, a synced folder, a machine you would rather
 not leave anything on - put `tools/whatsapp-portable.cmd` next to the exe and run that instead.
 It points the engine and the profile at subfolders beside itself, and uses a different
 single-instance port so it does not collide with an installed copy. The whole thing then weighs
-about **506 MB**: 124 MB exe, 346 MB unpacked engine, 36 MB profile. Copy the folder and your
-login travels with it.
+about **322 MB**: 130 MB exe, 156 MB compressed engine, 36 MB profile. Copy the folder and your
+login travels with it. On a stick formatted FAT32 or exFAT the compression cannot apply, and the
+folder is about 512 MB instead - it still runs, it just does not shrink.
 
 The one thing portable mode still leaves behind is that **Start Menu shortcut**, and it is not
 laziness: Windows silently refuses to draw a toast for an application whose AppUserModelID it
@@ -86,6 +96,9 @@ certificate costs money and is on the list; until then, the SHA-256 is in the re
 - **It watches itself.** The engine's debug log is capped at 16 MB, because Chromium neither
   rotates nor caps its own; and if the app ever catches itself writing megabytes a second or
   holding gigabytes of memory it raises a notification rather than quietly filling your disk.
+- **It halves itself on disk.** The unpacked engine is compressed in place with Windows'
+  own filesystem compression - the same mechanism Windows uses on its own system binaries -
+  which takes 346 MB down to 156 MB at no measurable memory cost.
 - `whatsapp.exe --minimized` starts in the tray; `whatsapp.exe --quit` asks a running instance
   to shut down cleanly (useful from scripts).
 
@@ -107,10 +120,13 @@ other three are from 2026-09-07 and are unaffected by that.
 
 | | processes | RAM | private | on disk | profile |
 | --- | --- | --- | --- | --- | --- |
-| **this app** (logged out) | **6** | **518 MB** | 350 MB | 347 MB | 36 MB |
+| **this app** (logged out) | **6** | **518 MB** | 350 MB | **156 MB** | 36 MB |
 | Meta's WhatsApp for Windows (logged in) | 8 | 1110 MB | 801 MB | 386 MB | 254 MB |
 | plain Chrome `--app` (what the old C# wrapper drove) | 10 | 800 MB | 571 MB | installed | 102 MB |
 | the old C# wrapper, measured 2026-09-06 | 10 | 803 MB | - | installed | 343 MB |
+
+The on-disk figure is 156 MB because the engine is compressed in place on first run; it unpacks
+to 346 MB and Windows stores it in 156 MB. Every other row is as that program ships it.
 
 The last two rows agree to within 3 MB, measured a day apart by different scripts, which is the
 check that the method is sound rather than flattering. Logged in with a real account and a full
@@ -145,6 +161,17 @@ That last row is the only genuinely light option and it is the one nobody can us
 is known only from reverse-engineering WhatsApp's apps, which their Terms forbid verbatim, and
 accounts have been permanently banned for it. The choice is 20 MB with a ban risk or ~520 MB
 without one. There is nothing in between, and Meta ships the same thing at 1110 MB.
+
+**And there is no smaller `libcef.dll` to switch to.** That was searched to the end on
+2026-09-10: 80 GitHub repositories, every release, every asset, 36 CEF binaries, zero failed API
+calls. The one 50.9 MB candidate, posted three days earlier, turned out to be a 2015-era Chromium
+- zero occurrences of `WebAssembly` anywhere in the binary - so it cannot render WhatsApp Web at
+all; everything else found is a repackage of the official distribution. Stripping Google's own
+services out of Chromium was measured at **0.2 MB** (ungoogled-chromium's `chrome.dll` at
+284.0 MB against stock Chrome's 284.3 MB, same branch, same architecture). The one thing left
+untried is a from-source build with `optimize_for_size=true`, worth at most ~48 MB on a 2016
+measurement, in exchange for owning a Chromium build on every CEF release forever. FINDINGS.md
+has the whole search.
 
 ## The one real gap
 
@@ -198,7 +225,7 @@ beside it at all.
 | file | role |
 | --- | --- |
 | `src/main.rs` | entry; finds or unpacks the engine, hands CEF's subprocesses back to CEF, handles `--quit`, shows fatal errors in a message box |
-| `src/engine.rs` | the engine the exe carries: the footer, the container format, unpack-and-verify, loading the DLLs, deleting old versions |
+| `src/engine.rs` | the engine the exe carries: the footer, the container format, unpack-and-verify, compressing the unpacked folder in place, loading the DLLs, deleting old versions |
 | `src/setup_window.rs` | the small "Setting up" window with its progress bar, on its own thread, shown only while unpacking |
 | `src/cef_view.rs` | the whole app: window, engine, permissions, the notification bridge and mute shim, tray wiring |
 | `src/notify.rs` | raising a Windows toast, and the three separate things that must be true first |

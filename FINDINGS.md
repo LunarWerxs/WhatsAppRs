@@ -1395,3 +1395,173 @@ so is left for a person to trigger.
 The eight `nvlddmkm` 153 events in three days on that machine are a separate, still-open,
 host-level problem. Nothing here stops them. What it does is make them cost a stutter instead of
 a night.
+
+# The size question, measured to the end and closed, 2026-09-10
+
+271 MB of `libcef.dll` is the single largest thing this project ships, and "surely there is a
+smaller one" is the question everybody asks, including the owner, three times, each time refusing
+an answer that came from reasoning rather than a measurement. He was right to refuse: the first
+two answers were wrong in ways only a measurement could expose. This section is what the
+measurements said, so nobody has to ask a fourth time.
+
+**The result in one line: there is no smaller modern `libcef.dll`, anywhere, and the only saving
+that actually exists is on disk, not in the binary.**
+
+## 1. Nobody publishes a smaller one. 80 repos, every release, every asset
+
+Done mechanically rather than by impression (`tools/`-style throwaway script, ten queries against
+the GitHub search API): **80 repositories, every release of each, every asset, 36 CEF-shaped
+release assets found, 0 failed API calls.**
+
+**One candidate looked exactly like the answer.** `skyc10/mcef-resources` published
+`0.6-win64-libcef.dll` at **50.9 MB on 2026-09-07** - a fifth of ours, three days old, a genuine
+x86-64 PE exporting `cef_initialize` and `cef_execute_process`, 38.4 MB of `.text` against our
+239.1 MB.
+
+**It is a ten-year-old Chromium, not a trimmed one.** In order of decisiveness:
+
+- **`WebAssembly`: 0 occurrences in the whole binary.** WASM shipped in Chrome 57, March 2017. A
+  libcef with no WASM string at all predates it. WhatsApp Web needs WASM, so this DLL cannot
+  render the site under any configuration.
+- The release ships **`ffmpegsumo.dll`** (removed from Chromium around 2016),
+  **`d3dcompiler_43.dll`** (modern is 47) and **`natives_blob.bin`** (dropped around Chromium 70).
+- It sits exactly on CEF's own historical size progression: `libcef.dll` went 58 -> 78 -> 105 ->
+  185 -> 271 MB across branches. 50 MB is what it weighed a decade ago.
+
+**Everything else found is a REPACKAGE of the official CEF distribution**, not a rebuild:
+`k1nader/cef_binary`, `winsoft666/cef_binary`, `jktimmer/cef_binary_download_workflow`,
+`mirrorforsupermarsx/mirror-cef_binary`, `sanwer/libcef`. Their archives (95 MB to 656 MB) track
+the official distribution for whichever branch and configuration they mirror. That same project's
+own MODERN build is 143.2 MB compressed, in line with everyone else.
+
+**A trap worth recording, because the first run of this sweep fell into it.** The script let
+Python default to cp1252; a repo description carried a non-latin1 byte; `subprocess` raised
+inside its reader thread; the call returned nothing; and the sweep confidently announced "nobody
+publishes this" off **4 repos instead of 80**. A search that fails silently is indistinguishable
+from a clean result. The script was changed to count and print its own failures and to refuse to
+conclude anything when any call failed - which is the only reason the 80-repo number can be
+believed.
+
+## 2. Removing Google's services from Chromium is worth 0.2 MB, not tens
+
+This is the number nobody had, and it is the one that kills the feature-stripping premise.
+
+Fingerprinting our own `libcef.dll` for marker strings found Safe Browsing (902 hits), autofill
+and the password manager (949), PDFium, extensions, sync, supervised users and devtools all
+compiled in. This app uses none of them. So: what is that layer worth?
+
+**ungoogled-chromium exists to remove exactly those things**, has years of patches doing it, and
+publishes **x64** binaries for Chromium 152.0.7977.82 - the same branch CEF 152 builds from. Their
+`chrome.dll` against stock Chrome's `chrome.dll` is therefore a direct measurement.
+
+| file | ungoogled-chromium | stock Chrome | difference |
+| --- | --- | --- | --- |
+| **`chrome.dll`** | **284.0 MB** | **284.3 MB** | **0.2 MB (0.1%)** |
+| `chrome.exe` | 4.1 MB | 4.3 MB | 0.2 MB |
+| `chrome_elf.dll` | 2.5 MB | 2.6 MB | 0.0 MB |
+| `resources.pak` | 20.6 MB | 22.1 MB | 1.5 MB (6.7%) |
+| `icudtl.dat` | 10.4 MB | 10.4 MB | 0 |
+
+**A mature project whose entire reason to exist is removing Google's services moves the engine
+binary by one part in a thousand.**
+
+**The honest caveat:** ungoogled largely disables and neuters rather than compiling code out, so
+this measures "turn Google's services off", not "compile them away". `enable_pdf=false` and
+friends genuinely remove code and could still do better. But it is the best available proxy and
+it points hard one way: the Google-services layer is not where the 271 MB lives.
+
+**Measurement I got wrong and caught:** the first run of this downloaded the **arm64** zip and
+compared arm64 code against x64 Chrome, producing a flattering 16.9 MB. That is not a comparison
+at all. Check the architecture of a downloaded artifact before believing any diff of it.
+
+## 3. What CEF actually locks, corrected
+
+An earlier answer in this project claimed CEF "hardcodes feature flags, so feature-stripping is
+foreclosed". **That was wrong**, and it came from generalising one forced flag to all of them.
+Reading CEF's `tools/gn_args.py` directly:
+
+- It **explicitly supports arbitrary Chromium GN args** through the `GN_DEFINES` environment
+  variable - a documented pass-through, not a hack.
+- `GetRequiredArgs()` forces exactly `optimize_webui`, `enable_widevine`,
+  `clang_use_chrome_plugins`, plus `enable_cdm_host_verification`, `enable_cdm_storage_id` and
+  `enable_rlz` on Windows and macOS. Nothing else.
+- `enable_pdf`, `enable_printing`, `safe_browsing_mode`, `enable_extensions` and
+  `optimize_for_size` are not mentioned in it at all and pass straight through.
+
+**The only thing CEF genuinely locks is DRM.** The door is not locked; the cost behind it is
+real - building CEF from source means 100+ GB of disk, hours per build, repeated on every CEF
+bump, forever. That is a choice about cost, and it must not be restated as a prohibition.
+
+**What survives all of the above as an unmeasured lever:** exactly one, `optimize_for_size=true`,
+a whole-build `-Oz`, published at roughly 20% of `.text`, about **48 MB**. The measurement is
+2016-era and predates ThinLTO and PGO, so treat it as an upper bound that may already have been
+eaten. Nobody has published a modern number, for it or for the feature flags, because as far as
+six angles of searching could establish **nobody has ever built one with features off and posted
+the before/after.** That is not evidence it does not work; it is evidence nobody tried in public.
+
+## 4. 32-bit is 44.3 MB smaller and is rejected anyway
+
+Measured by downloading CEF's own windows32 minimal distribution and counting bytes, not
+estimated: `libcef.dll` is **227.1 MB on 32-bit against 271.4 MB on 64-bit, 16.3% smaller**;
+`dxcompiler.dll` (24.6 MB) is absent from the 32-bit distribution entirely, and `chrome_elf.dll`
+is 1.1 MB smaller. The data files are byte-identical, which is the expected shape: 32-bit wins on
+code and nothing on data. About **70 MB off a 347 MB install**.
+
+Rejected: a 32-bit process caps at 4 GB of address space, which a long chat history plus a video
+call is exactly the case to find; CEF's maintainer calls 32-bit Windows effectively a legacy
+platform, so it is the first target dropped; and the missing `dxcompiler.dll` is an unproven
+capability question rather than a clean saving. DECISIONS.md #27.
+
+## 5. The one thing that DID work: Windows compresses the engine in half, on disk
+
+**345.9 MB becomes 156.0 MB - 190.0 MB, 54.9% - and it costs no memory.** Shipped 2026-09-10.
+
+**Why this is not the thing that already failed.** The CEF forum records UPX-packing `libcef.dll`
+as a measured failure: the packed DLL crashed cefclient. That is expected, because a packer
+decompresses the whole image eagerly into private memory and destroys the memory-mapping the
+loader depends on. **WOF (the Windows Overlay Filter, what `compact /exe:LZX` applies and what
+Compact OS uses on Windows' own system binaries) is a different mechanism entirely:** the file
+stays an ordinary PE, the loader memory-maps it as usual, and the filter decompresses pages on
+demand underneath into the *shared* file cache.
+
+| | before | after | saved |
+| --- | --- | --- | --- |
+| whole engine folder | 345.9 MB | **156.0 MB** | **190.0 MB (54.9%)** |
+| `libcef.dll` | 271.4 MB | **115.4 MB** | 156.0 MB (57%) |
+| `dxcompiler.dll` | 24.6 MB | 9.0 MB | 15.6 MB (63%) |
+| `icudtl.dat` | 10.4 MB | 4.3 MB | 6.1 MB (59%) |
+| `vk_swiftshader.dll` | 5.2 MB | 1.8 MB | 3.4 MB (65%) |
+| `resources.pak` | 20.7 MB | 18.7 MB | 2.0 MB (10%, already packed) |
+
+**Controlled A/B, compressed FIRST each round with the page cache flushed between every run, so
+every cache advantage favoured uncompressed:**
+
+| | compressed (LZX) | uncompressed |
+| --- | --- | --- |
+| time to renderer | **0.58 s** (0.39, 0.77) | **0.31 s** (0.29, 0.32) |
+| working set | 566.6 MB | 567.4 MB |
+| private bytes | 428.7 MB | 430.0 MB |
+
+**Memory is genuinely unaffected** - 566.6 against 567.4 MB is inside the noise - and that follows
+from the mechanism rather than being luck: WOF decompresses into the shared file cache, so pages
+stay shared across all six processes instead of becoming a private copy per process. The cost is
+**about +0.27 s of startup**, with a wider spread (0.39-0.77 against a tight 0.29-0.32), which is
+what per-page decompression looks like.
+
+**The first pass of this A/B was wrong and the correction matters.** It showed compression making
+startup three times FASTER, which is not a thing: that run went second, with a warm cache.
+Reversing the order flipped it.
+
+**LZX rather than XPRESS**, measured on this folder: LZX 156.0 MB, XPRESS16K 191.9 MB, XPRESS8K
+200.0 MB, XPRESS4K 214.4 MB, with the startup difference between modes inside run-to-run noise.
+36 MB for no measurable extra cost.
+
+It does **not** change the ~130 MB download, which is already zstd-compressed at level 22. This is
+a different axis: it is the number the user lives with afterwards.
+
+## What is left, honestly
+
+- `optimize_for_size=true`, unmeasured on a modern Chromium, upper bound 48 MB, cost is owning a
+  CEF build forever. The recommendation is no; the plan for doing it anyway is written up in the
+  (unpublished) to-do notes.
+- Nothing else. Every other avenue in this section was measured and closed.
