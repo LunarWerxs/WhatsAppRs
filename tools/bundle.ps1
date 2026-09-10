@@ -18,11 +18,14 @@ what it falls back to is `vk_swiftshader.dll`. Drop those files and the fallback
 empty, at which point Chromium stops the browser process rather than loop. Shipping the
 recovery path without the thing it recovers ONTO is not a saving. See DECISIONS.md #24.
 
-This script's default `-Out` is also the folder the owner's own install runs from, so a run
-without the fallbacks would have quietly disarmed a live app.
+Output goes to `dist\bundle` INSIDE the repo (2026-09-09). It used to default to
+`D:\wa-bundle\whatsapp`, which was wrong twice over: build output does not belong outside the
+project it was built from, and that exact folder was ALSO where a live install ran from, so a
+plain run of this script deleted and rewrote the files of a running app. Installing is now
+copying `dist\bundle` somewhere, which is a separate act from building it.
 #>
 param(
-    [string]$Out = 'D:\wa-bundle\whatsapp',
+    [string]$Out = (Join-Path (Split-Path $PSScriptRoot) 'dist\bundle'),
     [string]$From = (Join-Path (Split-Path $PSScriptRoot) 'target\release')
 )
 $ErrorActionPreference = 'Stop'

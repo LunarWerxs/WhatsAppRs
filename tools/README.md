@@ -4,6 +4,12 @@ Every number in README.md and FINDINGS.md came from one of these. They expect a 
 `target\release\whatsapp.exe` and Python 3 with `websocket-client` on PATH. Run from anywhere;
 paths are script-relative.
 
+**The shippable output lands in `dist\` at the top of the repo**: `dist\bundle\` is the 17-file
+engine folder, and `dist\whatsapp-rs-<version>-windows-x64.exe` is the single file a person
+downloads. It used to land in `D:\wa-bundle\`, outside the project and in the very folder a live
+install ran from, so building could rewrite the files of a running app. Building and installing
+are separate acts now.
+
 ## Build and ship
 
 | script | what it does |

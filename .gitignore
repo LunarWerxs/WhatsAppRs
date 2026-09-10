@@ -1,4 +1,7 @@
 /target
+# The shippable output. `dist/bundle` is the 17-file engine folder, `dist/*.exe` is the ONE
+# file a person downloads. Built artifacts, never committed; a GitHub release carries them.
+/dist/
 # CI points CEF_PATH at the workspace; never let 171 MB of engine near git.
 /.cef/
 /probe-report.jsonl

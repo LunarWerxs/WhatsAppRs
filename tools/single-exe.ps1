@@ -21,7 +21,7 @@ PowerShell's native-command path fails intermittently with "No process is on the
 the pipe". Start-Process with redirected files never touches a console.
 #>
 param(
-    [string]$Bundle = 'D:\wa-bundle\whatsapp',
+    [string]$Bundle = (Join-Path (Split-Path $PSScriptRoot) 'dist\bundle'),
     [string]$Out,
     [string]$Codec = 'zstd:22',
     [switch]$SkipBundle,
@@ -32,6 +32,8 @@ $repo = Split-Path $PSScriptRoot
 
 $version = (Select-String -Path (Join-Path $repo 'Cargo.toml') -Pattern '^version = "(.+)"' |
             Select-Object -First 1).Matches[0].Groups[1].Value
+# THE PRODUCT lands in `dist\` at the top of the repo, beside the bundle it was made from, so
+# that "where is the file a person downloads" has an obvious answer inside the project itself.
 if (-not $Out) { $Out = Join-Path (Split-Path $Bundle) "whatsapp-rs-$version-windows-x64.exe" }
 
 # The unit tests gate the RELEASE, because this repository has no CI and a guard nobody runs is

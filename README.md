@@ -167,6 +167,18 @@ tools\single-test.ps1    # prove it: that file alone, in an empty folder, starte
 tools\login.ps1          # open it on the persistent profile to scan a QR
 ```
 
+**Where the product ends up.** `single-exe.ps1` writes into `dist\` at the top of this repo:
+
+```
+dist\whatsapp-rs-<version>-windows-x64.exe   <- THE product. One file. This is what people download.
+dist\bundle\                                 <- the 17-file engine folder it was made from
+```
+
+`dist\` is gitignored, because a built artifact belongs on a GitHub release and not in the
+history. **Installing is a separate act from building**: copy the exe wherever you want to run
+it. Nothing in the build writes to wherever you happen to have installed it, which was not true
+before 2026-09-09 and cost a live app its files.
+
 Needs a Rust toolchain, Visual Studio Build Tools with the Windows SDK (`cmake`, `ninja`,
 `rc.exe`), Python 3 with `zstandard`, and about 1 GB of disk for the engine. The first build
 downloads the 171 MB CEF binary distribution into `%USERPROFILE%\.local\share\cef`.
