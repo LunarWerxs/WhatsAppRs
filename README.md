@@ -38,6 +38,25 @@ message cache live in `%LOCALAPPDATA%\WhatsAppRs`. To uninstall, delete the exe,
 **Quit from the tray menu, not from Task Manager.** A clean quit lets Chromium flush its cookies;
 a kill can lose the login and cost you another QR scan.
 
+### There is no installer, and there is a portable mode
+
+**The download IS the program.** No setup wizard, no Program Files, no registry keys, no uninstall
+entry. Put the exe anywhere and run it. What it writes outside its own folder is exactly two
+things: the engine and your profile under `%LOCALAPPDATA%\WhatsAppRs` (about 390 MB together),
+and one Start Menu shortcut.
+
+**To keep even those in one folder** - a USB stick, a synced folder, a machine you would rather
+not leave anything on - put `tools/whatsapp-portable.cmd` next to the exe and run that instead.
+It points the engine and the profile at subfolders beside itself, and uses a different
+single-instance port so it does not collide with an installed copy. The whole thing then weighs
+about **506 MB**: 124 MB exe, 346 MB unpacked engine, 36 MB profile. Copy the folder and your
+login travels with it.
+
+The one thing portable mode still leaves behind is that **Start Menu shortcut**, and it is not
+laziness: Windows silently refuses to draw a toast for an application whose AppUserModelID it
+does not know, and the shortcut is what carries that id. Delete it afterwards if you want no
+trace at all, and accept that notifications stop working.
+
 **The exe is not code-signed** (`Get-AuthenticodeSignature` says `NotSigned`), so Windows
 SmartScreen shows "Windows protected your PC" the first time: More info, then Run anyway. A
 certificate costs money and is on the list; until then, the SHA-256 is in the release notes and
