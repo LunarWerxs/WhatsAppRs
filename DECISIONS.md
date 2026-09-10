@@ -3,6 +3,37 @@
 Settled decisions. Do not re-litigate these, do not ask for re-confirmation, do not propose
 alternatives that contradict them. Owner is Michael.
 
+---
+
+# ⛔⛔ READ THIS BEFORE PROPOSING ANY ENGINE. EVER. ⛔⛔
+
+# THE ENGINE MUST BE OS-AGNOSTIC. THE SAME ENGINE ON WINDOWS, MACOS AND LINUX. NO EXCEPTIONS.
+
+> **"I will never, ever, ever, ever goddamn use a motherfucking browser that is not OS
+> agnostic."**
+>
+> Michael, 2026-09-09, after WebView2 was raised for the third time across this project.
+
+**If it does not run on Windows AND macOS AND Linux, it is not a candidate. Do not raise it. Do
+not raise it "just to note the option". Do not raise it because it would be smaller. Do not raise
+it because someone on the internet did it. The size argument is dead: it has been searched to the
+end and written up in this file, and the answer does not change the rule.**
+
+**WebView2 / Microsoft Edge is PERMANENTLY OUT and is never to be mentioned as an option again.**
+Microsoft ships WebView2 for **Windows only**. There is no Linux build. There is no macOS build.
+It therefore fails this rule at the first hurdle, before anyone gets to the size, the user agent,
+the identity, or how many megabytes it would save. Every "but the user agent can be spoofed now"
+thread is answered by the line above, not by a counter-argument.
+
+The same disqualification applies to **every** OS-supplied webview by definition: WKWebView on
+macOS and WebKitGTK on Linux are DIFFERENT ENGINES, so "use the system webview" is three engines
+wearing a trench coat, not one. That is the arrangement ruling #12 already rejected in anger.
+
+This is why the app bundles CEF, and why 271 MB of libcef.dll is the accepted price. See #7, #12
+and #26.
+
+---
+
 ## 2026-09-06
 
 **1. Meta's official WhatsApp for Windows is REJECTED, permanently.**
@@ -386,3 +417,32 @@ fork, and it does not retract anything anyway: git has already served it, and Gi
 and archives keep their copies. Paying that cost to un-publish two first names and some `D:\` paths
 would be theatre. If something genuinely secret ever does land here, the answer is different and
 starts with rotating the secret, not with rewriting history.
+
+**26. ⛔ THE ENGINE IS OS-AGNOSTIC OR IT IS NOT A CANDIDATE. WebView2 is permanently closed
+(2026-09-09).** His words, and the banner at the top of this file carries them in full: *"I will
+never, ever, ever, ever goddamn use a motherfucking browser that is not OS agnostic."* Said after
+WebView2 came up for the third time in this project's life, the third time being mine.
+
+**The rule, stated so there is nothing left to interpret:** an engine is only a candidate if the
+SAME engine runs on Windows, macOS and Linux. Not "an engine on each". The same one. Anything
+that fails that is out before its size, its speed, its identity or its convenience is discussed,
+and it is out permanently rather than pending better arguments.
+
+**WebView2 fails at the first hurdle: Microsoft ships it for Windows only.** No Linux build
+exists. No macOS build exists. Every clever thing that is true about it downstream of that
+(`CoreWebView2Settings.UserAgent` is settable, the client hints can be suppressed, a shipping
+wrapper installs at 2 MB) is irrelevant, because the rule is not about the user agent and never
+was. #7 and #12 said this already, in 2026-09-06 and 2026-09-07; this entry exists because the
+option kept being re-raised anyway, including by me, on the grounds that new facts had appeared.
+New facts about a disqualified candidate do not requalify it.
+
+**By the same rule, "just use the system webview" is out on every platform, permanently.** It
+means WebView2 on Windows, WKWebView on macOS and WebKitGTK on Linux: three different engines,
+three different bug surfaces, three different identities on the phone's linked-device list. That
+is precisely the arrangement #12 rejected.
+
+**Do not raise this to ask whether the rule still holds.** It holds. The size question that
+motivated every re-raise has now been searched to the end and answered: no smaller engine capable
+of rendering web.whatsapp.com exists anywhere, CEF's own maintainer says the size is inherent to
+Chromium, and every wrapper that bundles a real Chromium lands in our band. 271 MB is the price of
+the rule, the price is accepted, and the matter is closed.

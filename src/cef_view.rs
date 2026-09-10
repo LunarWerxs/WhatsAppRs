@@ -1,5 +1,24 @@
 //! Safe mode on a bundled Chromium: the Chromium Embedded Framework, in our own window.
 //!
+//! # ⛔⛔ THE ENGINE IS OS-AGNOSTIC OR IT IS NOT A CANDIDATE ⛔⛔
+//!
+//! > **"I will never, ever, ever, ever goddamn use a motherfucking browser that is not OS
+//! > agnostic."** - Michael, 2026-09-09 (DECISIONS.md #26, and the banner at the top of it)
+//!
+//! **The same engine on Windows, macOS and Linux, or it is out.** Not one engine per platform.
+//! The same one. This is WHY this file bundles CEF and why 271 MB of `libcef.dll` is an accepted
+//! cost rather than a problem to be solved.
+//!
+//! **⛔ WebView2 / Microsoft Edge is permanently closed. Do not raise it.** Microsoft ships
+//! WebView2 for Windows only: no Linux build, no macOS build. It fails the rule before its size,
+//! its user agent or its identity is worth a sentence. The same goes for "just use the system
+//! webview", which is WebView2 plus WKWebView plus WebKitGTK, three engines pretending to be a
+//! strategy.
+//!
+//! The size argument that keeps motivating this has been searched to the end and closed: no
+//! smaller engine that can render web.whatsapp.com exists, CEF's own maintainer states the size
+//! is inherent to Chromium, and every wrapper bundling a real Chromium lands in the same band.
+//!
 //! This is the first of the two candidates ruled in by DECISIONS.md #15. The engine
 //! ships with the app rather than being the operating system's (which is Edge here, and
 //! rejected) or a browser the user has installed. CEF gives a real child HWND, so the
