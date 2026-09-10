@@ -8,8 +8,8 @@ scratch, no forked code, MIT licensed. Not made by or affiliated with WhatsApp o
 
 **One executable, no installer, nothing to unzip.** 130 MB to download, 156 MB on disk after it
 unpacks, 6 processes, 518 MB of RAM logged out. Most of that is WhatsApp's own JavaScript, not
-this wrapper. See "Why it is
-500 MB" below, because that is the question everybody asks and it has a measured answer.
+this wrapper. See "Why it is 500 MB" below, because that is the question everybody asks and
+it has a measured answer.
 
 ## Download and run
 
