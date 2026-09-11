@@ -67,10 +67,10 @@ laziness: Windows silently refuses to draw a toast for an application whose AppU
 does not know, and the shortcut is what carries that id. Delete it afterwards if you want no
 trace at all, and accept that notifications stop working.
 
-**The exe is not code-signed** (`Get-AuthenticodeSignature` says `NotSigned`), so Windows
-SmartScreen shows "Windows protected your PC" the first time: More info, then Run anyway. A
-certificate costs money and is on the list; until then, the SHA-256 is in the release notes and
-`Get-FileHash` will tell you the download is the file that was published.
+**The exe is not code-signed yet** (`Get-AuthenticodeSignature` says `NotSigned`), so Windows
+SmartScreen shows "Windows protected your PC" the first time: More info, then Run anyway. Signing
+is planned and no date is promised. Until a release says otherwise, the SHA-256 is published in
+the release notes and `Get-FileHash` will tell you the download is the file that was published.
 
 ## What it does
 

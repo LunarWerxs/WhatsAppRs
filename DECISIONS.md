@@ -520,3 +520,31 @@ measured to the end and closed".
 
 **271 MB is the price of the rule in #26, the price is accepted, and re-searching it is not
 work.** If someone wants the last 48 MB, the path is a build project, not another search.
+
+**30. The release WILL be code-signed, through Azure Artifact Signing, and NOT yet (2026-09-10).**
+His words: "we will be... signing this at some point, as I already have a plan. But at this exact
+moment, we will... Hold off. You may also... note that we will be using the Connections MCP
+server, which has Azure signing in it."
+
+Two separate rulings, and the second is the one that is easy to get wrong:
+
+- **The route is decided: Azure Artifact Signing** (the service formerly called Trusted Signing),
+  driven from this workspace's own tooling against a vaulted credential, with no signing key ever
+  handled by a person and none in a repository or a CI job. That closes the "a certificate costs
+  money and is on the list" line the README and the handoff notes had carried since v0.1.0. It
+  was never the real blocker and must not be restated as one.
+- **Nothing is signed now, and nothing is prepared for it either.** He is holding; lifting the
+  hold is his call alone. Do not sign a release, do not provision a signing credential, and do
+  not add a signing step to a release script or workflow "ready for when we turn it on" - a
+  signing call that exists is a signing call that gets run by accident.
+
+Two things signing will quietly break, recorded here so they are not discovered on release day:
+the **published SHA-256**, because signing rewrites the file and a hash taken before it would
+never match a stranger's download; and possibly the **engine payload**, which the exe finds by
+seeking back from the end of its own file, while Authenticode appends a certificate table to the
+end of the file too. Whether those collide is one five-minute test on a throwaway build, and it
+happens before anything ships. The runbook is in this repository's (gitignored) to-do list.
+
+What stays true meanwhile: the exe is unsigned, SmartScreen warns on it, and the SHA-256 in the
+release notes is how a stranger checks the download. The README says exactly that, says signing
+is planned, and promises no date.
